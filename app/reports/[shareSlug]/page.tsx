@@ -67,7 +67,7 @@ export default async function ReportPage({ params }: ReportPageProps) {
   }
 
   const maxDaily = Math.max(
-    ...report.daily.map((day) => Math.max(day.sent, day.clicks)),
+    ...report.daily.map((day: any) => Math.max(Number(day.sent) || 0, Number(day.clicks) || 0)),
     1
   );
 
@@ -164,20 +164,20 @@ export default async function ReportPage({ params }: ReportPageProps) {
               </p>
             </div>
             <div className="mt-8 grid h-56 grid-cols-7 items-end gap-3">
-              {report.daily.map((day) => (
+              {report.daily.map((day: any) => (
                 <div key={day.date} className="flex h-full flex-col justify-end gap-2">
                   <div className="flex min-h-0 flex-1 items-end gap-1">
                     <div
                       className="w-full bg-cyan-300/75"
                       style={{
-                        height: `${Math.max((day.sent / maxDaily) * 100, 4)}%`,
+                        height: `${Math.max(((Number(day.sent) || 0) / maxDaily) * 100, 4)}%`,
                       }}
                       title={`${day.sent} sent`}
                     />
                     <div
                       className="w-full bg-emerald-300/75"
                       style={{
-                        height: `${Math.max((day.clicks / maxDaily) * 100, 4)}%`,
+                        height: `${Math.max(((Number(day.clicks) || 0) / maxDaily) * 100, 4)}%`,
                       }}
                       title={`${day.clicks} clicks`}
                     />
@@ -233,7 +233,7 @@ export default async function ReportPage({ params }: ReportPageProps) {
                     This campaign does not have a tracked link.
                   </p>
                 )}
-                {report.trackedLinks.map((link) => (
+                {report.trackedLinks.map((link: any) => (
                   <div
                     key={link.slug}
                     className="flex items-center justify-between gap-4"
@@ -259,7 +259,7 @@ export default async function ReportPage({ params }: ReportPageProps) {
                 Keywords
               </p>
               <div className="mt-3 flex flex-wrap gap-2">
-                {report.campaign.keywords.map((keyword) => (
+                {report.campaign.keywords.map((keyword: any) => (
                   <span
                     key={keyword}
                     className="border border-white/10 bg-zinc-950 px-2 py-1 text-xs font-semibold text-zinc-300"

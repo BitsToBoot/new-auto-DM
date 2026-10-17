@@ -13,7 +13,6 @@ export interface DevMagicLink {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __lastDevMagicLink: DevMagicLink | undefined;
 }
 

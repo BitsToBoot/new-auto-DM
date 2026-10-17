@@ -223,4 +223,39 @@ describe("parseCommentEvents", () => {
     const events = parseCommentEvents(payload);
     expect(events).toHaveLength(0);
   });
+
+  it("should parse duplicate webhook deliveries deterministically", () => {
+    const payload = {
+      object: "instagram",
+      entry: [
+        {
+          id: "page_123",
+          time: 1234567890,
+          changes: [
+            {
+              field: "comments",
+              value: {
+                id: "comment_dup",
+                text: "DUPLICATE TEST",
+                from: { id: "user_1", username: "user1" },
+                media: { id: "media_1" },
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const firstEvents = parseCommentEvents(payload);
+    const secondEvents = parseCommentEvents(payload);
+
+    expect(firstEvents).toEqual(secondEvents);
+    expect(firstEvents[0].commentId).toBe("comment_dup");
+
+    // Both produce identical BullMQ jobId for deduplication
+    const jobId1 = `comment:${firstEvents[0].instagramAccountId}:${firstEvents[0].commentId}`;
+    const jobId2 = `comment:${secondEvents[0].instagramAccountId}:${secondEvents[0].commentId}`;
+    expect(jobId1).toBe(jobId2);
+    expect(jobId1).toBe("comment:page_123:comment_dup");
+  });
 });

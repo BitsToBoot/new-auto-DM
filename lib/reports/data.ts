@@ -16,11 +16,11 @@ function getHostname(url: string) {
 
 function getDayWindow(daysAgo: number) {
   const now = new Date();
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  start.setDate(start.getDate() - daysAgo);
+  const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  start.setUTCDate(start.getUTCDate() - daysAgo);
 
   const end = new Date(start);
-  end.setDate(end.getDate() + 1);
+  end.setUTCDate(end.getUTCDate() + 1);
 
   return { start, end };
 }
@@ -107,49 +107,57 @@ export async function getCampaignReportBySlug(shareSlug: string) {
     ]);
 
   const statusSummary = summarizeDmStatuses(
-    statusRows.map((row) => ({
+    statusRows.map((row: any) => ({
       status: row.status,
       _count: row._count._all,
     }))
   );
   const topKeywords = normalizeTopKeywords(
-    keywordRows.map((row) => ({
+    keywordRows.map((row: any) => ({
       matchedKeyword: row.matchedKeyword,
       _count: row._count._all,
     }))
   );
-  const daily = await Promise.all(
-    Array.from({ length: 7 }, async (_, index) => {
-      const daysAgo = 6 - index;
-      const { start, end } = getDayWindow(daysAgo);
-      const [sent, clicks] = await Promise.all([
-        prisma.dmLog.count({
-          where: {
-            workspaceId: automation.workspaceId,
-            automationId: automation.id,
-            status: "SENT",
-            createdAt: { gte: start, lt: end },
-          },
-        }),
-        prisma.linkClick.count({
-          where: {
-            workspaceId: automation.workspaceId,
-            automationId: automation.id,
-            createdAt: { gte: start, lt: end },
-          },
-        }),
-      ]);
+  // Two aggregate queries replace 14 per-day counts (7 days × 2 tables).
+  const sevenDaysAgo = getDayWindow(6).start;
 
-      return {
-        date: start.toLocaleDateString("en-US", {
-          month: "short",
-          day: "numeric",
-        }),
-        sent,
-        clicks,
-      };
-    })
-  );
+  type DailyAgg = { day: Date; count: bigint };
+  const [rawDmDays, rawClickDays] = await Promise.all([
+    prisma.$queryRaw<DailyAgg[]>`
+      SELECT DATE_TRUNC('day', "createdAt") AS day, COUNT(*)::bigint AS count
+      FROM "DmLog"
+      WHERE "workspaceId" = ${automation.workspaceId}
+        AND "automationId" = ${automation.id}
+        AND status = 'SENT'
+        AND "createdAt" >= ${sevenDaysAgo}
+      GROUP BY DATE_TRUNC('day', "createdAt")
+      ORDER BY day ASC
+    `,
+    prisma.$queryRaw<DailyAgg[]>`
+      SELECT DATE_TRUNC('day', "createdAt") AS day, COUNT(*)::bigint AS count
+      FROM "LinkClick"
+      WHERE "workspaceId" = ${automation.workspaceId}
+        AND "automationId" = ${automation.id}
+        AND "createdAt" >= ${sevenDaysAgo}
+      GROUP BY DATE_TRUNC('day', "createdAt")
+      ORDER BY day ASC
+    `,
+  ]);
+
+  const dmByDay = new Map(rawDmDays.map((r: any) => [r.day.toISOString().slice(0, 10), Number(r.count)]));
+  const clickByDay = new Map(rawClickDays.map((r: any) => [r.day.toISOString().slice(0, 10), Number(r.count)]));
+
+  const daily = Array.from({ length: 7 }, (_, index) => {
+    const daysAgo = 6 - index;
+    const { start } = getDayWindow(daysAgo);
+    const iso = start.toISOString().slice(0, 10);
+    return {
+      date: start.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" }),
+      sent: dmByDay.get(iso) ?? 0,
+      clicks: clickByDay.get(iso) ?? 0,
+    };
+  });
+
 
   return {
     shareSlug: automation.reportShareSlug,
@@ -182,7 +190,7 @@ export async function getCampaignReportBySlug(shareSlug: string) {
     },
     topKeywords,
     daily,
-    trackedLinks: automation.trackedLinks.map((link) => ({
+    trackedLinks: automation.trackedLinks.map((link: any) => ({
       slug: link.slug,
       destinationHost: getHostname(link.destinationUrl),
       clicks: link._count.clicks,

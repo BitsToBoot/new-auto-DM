@@ -6,42 +6,13 @@ const {
   mockDecryptToken,
   mockMatchKeywords,
   mockReserveDMSlot,
+  mockReleaseDMSlot,
   mockQueueAdd,
   mockReserveWorkspaceDMSend,
   mockReleaseWorkspaceDMReservation,
-} = vi.hoisted(() => ({
-  mockPrisma: {
-    automation: {
-      findMany: vi.fn(),
-    },
-    dmLog: {
-      findUnique: vi.fn(),
-      upsert: vi.fn(),
-      update: vi.fn(),
-    },
-    instagramAccount: {
-      findUnique: vi.fn(),
-    },
-    operationalEvent: {
-      create: vi.fn(),
-    },
-  },
-  mockSendPrivateReply: vi.fn(),
-  mockDecryptToken: vi.fn(),
-  mockMatchKeywords: vi.fn(),
-  mockReserveDMSlot: vi.fn(),
-  mockQueueAdd: vi.fn(),
-  mockReserveWorkspaceDMSend: vi.fn(),
-  mockReleaseWorkspaceDMReservation: vi.fn(),
-}));
-
-vi.mock("@/lib/db/client", () => ({
-  prisma: mockPrisma,
-}));
-
-vi.mock("@/lib/meta/client", () => ({
-  sendPrivateReply: mockSendPrivateReply,
-  MetaApiError: class MetaApiError extends Error {
+  MockMetaApiError,
+} = vi.hoisted(() => {
+  class MockMetaApiError extends Error {
     code: number;
     constructor(
       code: number,
@@ -53,7 +24,47 @@ vi.mock("@/lib/meta/client", () => ({
       this.code = code;
       this.name = "MetaApiError";
     }
-  },
+  }
+
+  return {
+    mockPrisma: {
+      automation: {
+        findMany: vi.fn(),
+      },
+      dmLog: {
+        findUnique: vi.fn(),
+        create: vi.fn(),
+        upsert: vi.fn(),
+        update: vi.fn(),
+        updateMany: vi.fn(),
+      },
+      instagramAccount: {
+        findUnique: vi.fn(),
+        updateMany: vi.fn(),
+      },
+      operationalEvent: {
+        create: vi.fn(),
+      },
+    },
+    mockSendPrivateReply: vi.fn(),
+    mockDecryptToken: vi.fn(),
+    mockMatchKeywords: vi.fn(),
+    mockReserveDMSlot: vi.fn(),
+    mockReleaseDMSlot: vi.fn(),
+    mockQueueAdd: vi.fn(),
+    mockReserveWorkspaceDMSend: vi.fn(),
+    mockReleaseWorkspaceDMReservation: vi.fn(),
+    MockMetaApiError,
+  };
+});
+
+vi.mock("@/lib/db/client", () => ({
+  prisma: mockPrisma,
+}));
+
+vi.mock("@/lib/meta/client", () => ({
+  sendPrivateReply: mockSendPrivateReply,
+  MetaApiError: MockMetaApiError,
 }));
 
 vi.mock("@/lib/meta/oauth", () => ({
@@ -66,6 +77,7 @@ vi.mock("@/lib/utils/keyword-matcher", () => ({
 
 vi.mock("@/lib/utils/rate-limiter", () => ({
   reserveDMSlot: mockReserveDMSlot,
+  releaseDMSlot: mockReleaseDMSlot,
 }));
 
 vi.mock("@/lib/billing/usage", () => ({
@@ -156,11 +168,15 @@ beforeEach(() => {
 
   mockPrisma.automation.findMany.mockResolvedValue([mockAutomation]);
   mockPrisma.dmLog.findUnique.mockResolvedValue(null);
+  mockPrisma.dmLog.create.mockResolvedValue({});
   mockPrisma.dmLog.upsert.mockResolvedValue({});
   mockPrisma.dmLog.update.mockResolvedValue({});
+  mockPrisma.dmLog.updateMany.mockResolvedValue({ count: 1 });
   mockPrisma.instagramAccount.findUnique.mockResolvedValue({
     workspaceId: "workspace_123",
   });
+  mockPrisma.instagramAccount.updateMany.mockResolvedValue({ count: 1 });
+  mockReleaseDMSlot.mockResolvedValue(10);
   mockPrisma.operationalEvent.create.mockResolvedValue({});
   mockDecryptToken.mockReturnValue("decrypted_token");
   mockMatchKeywords.mockReturnValue({ matched: true, matchedKeyword: "LINK" });
@@ -227,15 +243,13 @@ describe("DM Worker — Full Pipeline", () => {
       "Hey commenter_user! Here is the link: https://example.com"
     );
     expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
-    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
-      where: {
-        automationId_commentId: {
-          automationId: "auto_789",
-          commentId: "comment_555",
-        },
-      },
-      data: expect.objectContaining({ status: "SENT" }),
-    });
+    // The worker calls dmLog.update twice on success: once for SENDING and
+    // once for SENT. We assert the final SENT call was made.
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "SENT" }),
+      })
+    );
   });
 
   it("should skip when no automations match the media", async () => {
@@ -245,7 +259,7 @@ describe("DM Worker — Full Pipeline", () => {
     await processor(createMockJob());
 
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
-    expect(mockPrisma.dmLog.upsert).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.create).not.toHaveBeenCalled();
   });
 
   it("should skip when keywords do not match", async () => {
@@ -350,8 +364,8 @@ describe("DM Worker — Full Pipeline", () => {
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
   });
 
-  it("should log FAILED, release usage, and re-throw when private reply sending fails", async () => {
-    const error = new Error("API Error");
+  it("should log FAILED, release usage, and re-throw when private reply sending fails with transient Meta error", async () => {
+    const error = new MockMetaApiError(500, undefined, undefined, "API Error");
     mockSendPrivateReply.mockRejectedValue(error);
 
     const processor = getProcessor();
@@ -370,7 +384,31 @@ describe("DM Worker — Full Pipeline", () => {
       },
       data: expect.objectContaining({
         status: "FAILED",
-        errorMessage: "API Error",
+        errorMessage: expect.stringContaining("API Error"),
+      }),
+    });
+  });
+
+  it("should mark UNKNOWN and NOT re-throw when an ambiguous network error occurs", async () => {
+    mockSendPrivateReply.mockRejectedValue(new Error("ECONNRESET"));
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
+      where: {
+        automationId_commentId: {
+          automationId: "auto_789",
+          commentId: "comment_555",
+        },
+      },
+      data: expect.objectContaining({
+        status: "UNKNOWN",
+        errorMessage: expect.stringContaining("ECONNRESET"),
       }),
     });
   });
@@ -389,9 +427,9 @@ describe("DM Worker — Full Pipeline", () => {
     const processor = getProcessor();
     await processor(createMockJob());
 
-    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        create: expect.objectContaining({
+        data: expect.objectContaining({
           status: "FAILED",
           errorMessage: "No Instagram access token available",
         }),
@@ -444,5 +482,125 @@ describe("DM Worker — Full Pipeline", () => {
       "comment_555",
       "Hey commenter_user! Here is the offer: http://localhost:3000/r/abc123"
     );
+  });
+
+  it("should abort send and release reservations if another worker claims SENDING first", async () => {
+    // updateMany for SENDING claim returns count: 0 (claim lost to concurrent worker)
+    mockPrisma.dmLog.updateMany.mockResolvedValueOnce({ count: 0 });
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    expect(mockReleaseDMSlot).toHaveBeenCalledWith("ig_456");
+  });
+
+  it("should mark FAILED and release rate limit on permanent Meta error (code 100) without re-throwing", async () => {
+    const permError = new MockMetaApiError(100, undefined, undefined, "Invalid parameter");
+    mockSendPrivateReply.mockRejectedValue(permError);
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    expect(mockReleaseDMSlot).toHaveBeenCalledWith("ig_456");
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "FAILED",
+          errorMessage: expect.stringContaining("Meta API 100"),
+        }),
+      })
+    );
+  });
+
+  it("should mark account token expired on Meta code 190 and create operational event", async () => {
+    const tokenError = new MockMetaApiError(
+      190,
+      undefined,
+      undefined,
+      "Error validating access token: Session has expired"
+    );
+    mockSendPrivateReply.mockRejectedValue(tokenError);
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
+      "workspace_123",
+      usagePeriodStart
+    );
+    expect(mockReleaseDMSlot).toHaveBeenCalledWith("ig_456");
+    expect(mockPrisma.instagramAccount.updateMany).toHaveBeenCalledWith({
+      where: { instagramId: "ig_456" },
+      data: { tokenExpiresAt: new Date(0) },
+    });
+    expect(mockPrisma.operationalEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          source: "WORKER",
+          level: "ERROR",
+        }),
+      })
+    );
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "FAILED",
+        }),
+      })
+    );
+  });
+
+  it("should deterministically select the first matching automation and only send one DM", async () => {
+    const secondAutomation = {
+      ...mockAutomation,
+      id: "auto_second",
+      name: "Second overlapping automation",
+      keywords: ["LINK"],
+      dmMessage: "Second message",
+    };
+    mockPrisma.automation.findMany.mockResolvedValue([
+      mockAutomation,
+      secondAutomation,
+    ]);
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(mockSendPrivateReply).toHaveBeenCalledWith(
+      "decrypted_token",
+      "ig_456",
+      "comment_555",
+      "Hey commenter_user! Here is the link: https://example.com"
+    );
+  });
+
+  it("should transition prior crashed SENDING record to UNKNOWN and not re-send", async () => {
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      id: "existing_log",
+      status: "SENDING",
+    });
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "UNKNOWN",
+        }),
+      })
+    );
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
   });
 });

@@ -66,7 +66,7 @@ async function getMemberPayload(
   return {
     ...(currentUserRole ? { currentUserRole } : {}),
     members,
-    invitations: invitations.map((invitation) => ({
+    invitations: invitations.map((invitation: any) => ({
       ...invitation,
       inviteUrl: buildInvitationUrl(invitation.token),
     })),

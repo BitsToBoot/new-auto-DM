@@ -1,13 +1,12 @@
 import { prisma } from "@/lib/db/client";
 import { getEffectivePlan, PLAN_LIMITS } from "@/lib/billing/plans";
-import type { Prisma } from "@/app/generated/prisma/client";
 
 function getMonthStart(date = new Date()): Date {
   return new Date(date.getFullYear(), date.getMonth(), 1);
 }
 
 async function resetUsageIfNeededTx(
-  tx: Prisma.TransactionClient,
+  tx: any,
   workspaceId: string
 ): Promise<void> {
   const now = new Date();
@@ -42,7 +41,7 @@ export interface WorkspaceDMReservation {
 export async function reserveWorkspaceDMSend(
   workspaceId: string
 ): Promise<WorkspaceDMReservation> {
-  return prisma.$transaction(async (tx) => {
+  return prisma.$transaction(async (tx: any) => {
     await resetUsageIfNeededTx(tx, workspaceId);
 
     const monthStart = getMonthStart();

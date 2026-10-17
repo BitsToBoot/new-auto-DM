@@ -18,10 +18,10 @@ export async function GET(request: NextRequest) {
   }
 
   const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const weekStart = new Date(todayStart);
-  weekStart.setDate(weekStart.getDate() - 7);
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  weekStart.setUTCDate(weekStart.getUTCDate() - 6);
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   const requestedInstagramAccountId =
     request.nextUrl.searchParams.get("instagramAccountId");
   const selectedAccountId =
@@ -136,25 +136,43 @@ export async function GET(request: NextRequest) {
     }),
   ]);
 
+  // Single aggregate query replacing 7 sequential per-day counts.
+  // Two branches (with/without account filter) to avoid nesting $queryRaw,
+  // which Prisma does not support.
+  type DailyRow = { day: Date; count: bigint };
+  const rawDailyRows = await (selectedAccountId
+    ? prisma.$queryRaw<DailyRow[]>`
+        SELECT DATE_TRUNC('day', "createdAt") AS day, COUNT(*)::bigint AS count
+        FROM "DmLog"
+        WHERE "workspaceId" = ${workspaceId}
+          AND status = 'SENT'
+          AND "createdAt" >= ${weekStart}
+          AND "instagramAccountId" = ${selectedAccountId}
+        GROUP BY DATE_TRUNC('day', "createdAt")
+        ORDER BY day ASC
+      `
+    : prisma.$queryRaw<DailyRow[]>`
+        SELECT DATE_TRUNC('day', "createdAt") AS day, COUNT(*)::bigint AS count
+        FROM "DmLog"
+        WHERE "workspaceId" = ${workspaceId}
+          AND status = 'SENT'
+          AND "createdAt" >= ${weekStart}
+        GROUP BY DATE_TRUNC('day', "createdAt")
+        ORDER BY day ASC
+      `);
+
+  // Build a full 7-day series, filling 0 for days with no data.
+  const countByDay = new Map<string, number>(
+    rawDailyRows.map((r: any) => [r.day.toISOString().slice(0, 10), Number(r.count)])
+  );
   const dailyDMs: { date: string; count: number }[] = [];
   for (let i = 6; i >= 0; i--) {
     const dayStart = new Date(todayStart);
-    dayStart.setDate(dayStart.getDate() - i);
-    const dayEnd = new Date(dayStart);
-    dayEnd.setDate(dayEnd.getDate() + 1);
-
-    const count = await prisma.dmLog.count({
-      where: {
-        workspaceId,
-        status: "SENT",
-        createdAt: { gte: dayStart, lt: dayEnd },
-        ...accountFilter,
-      },
-    });
-
+    dayStart.setUTCDate(dayStart.getUTCDate() - i);
+    const isoDate = dayStart.toISOString().slice(0, 10);
     dailyDMs.push({
-      date: dayStart.toLocaleDateString("en-US", { weekday: "short" }),
-      count,
+      date: dayStart.toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" }),
+      count: countByDay.get(isoDate) ?? 0,
     });
   }
 
@@ -162,13 +180,13 @@ export async function GET(request: NextRequest) {
     ? getEffectivePlan(workspace.plan, workspace.subscriptionStatus)
     : "FREE";
   const monthlyStatusSummary = summarizeDmStatuses(
-    dmStatusCountsThisMonth.map((row) => ({
+    dmStatusCountsThisMonth.map((row: any) => ({
       status: row.status,
       _count: row._count._all,
     }))
   );
   const topKeywords = normalizeTopKeywords(
-    topKeywordRows.map((row) => ({
+    topKeywordRows.map((row: any) => ({
       matchedKeyword: row.matchedKeyword,
       _count: row._count._all,
     }))

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { mockPrisma } = vi.hoisted(() => ({
   mockPrisma: {
+    $queryRaw: vi.fn().mockResolvedValue([]),
     automation: {
       findFirst: vi.fn(),
     },
@@ -54,6 +55,7 @@ const baseAutomation = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockPrisma.$queryRaw.mockResolvedValue([]);
   mockPrisma.automation.findFirst.mockResolvedValue(baseAutomation);
   mockPrisma.dmLog.groupBy
     .mockResolvedValueOnce([
@@ -134,5 +136,32 @@ describe("campaign reports", () => {
     );
     expect(isReportBranded("FREE", "NONE")).toBe(true);
     expect(isReportBranded("AGENCY", "ACTIVE")).toBe(false);
+  });
+
+  it("correctly maps raw SQL daily aggregates to the 7-day daily series across UTC boundaries", async () => {
+    const today = new Date();
+    const todayUtc = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+    const yesterdayUtc = new Date(todayUtc);
+    yesterdayUtc.setUTCDate(yesterdayUtc.getUTCDate() - 1);
+
+    mockPrisma.$queryRaw
+      .mockResolvedValueOnce([
+        { day: todayUtc, count: BigInt(5) },
+        { day: yesterdayUtc, count: BigInt(3) },
+      ])
+      .mockResolvedValueOnce([
+        { day: todayUtc, count: BigInt(2) },
+      ]);
+
+    const report = await getCampaignReportBySlug("report_123");
+
+    expect(report?.daily).toHaveLength(7);
+    const todayEntry = report?.daily[6];
+    const yesterdayEntry = report?.daily[5];
+
+    expect(todayEntry?.sent).toBe(5);
+    expect(todayEntry?.clicks).toBe(2);
+    expect(yesterdayEntry?.sent).toBe(3);
+    expect(yesterdayEntry?.clicks).toBe(0);
   });
 });

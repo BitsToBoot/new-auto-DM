@@ -7,6 +7,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -86,6 +87,9 @@ model Workspace {
   instagramAccounts InstagramAccount[]
   automations       Automation[]
   dmLogs            DmLog[]
+  deliveryJobs      DeliveryJob[]
+  contacts          Contact[]
+  contactEvents     ContactEvent[]
   trackedLinks      TrackedLink[]
   linkClicks        LinkClick[]
   webhookEvents     WebhookEvent[]
@@ -143,42 +147,189 @@ model InstagramAccount {
   connectedAt       DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  automations Automation[]
-  dmLogs      DmLog[]
-  linkClicks  LinkClick[]
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  automations  Automation[]
+  dmLogs       DmLog[]
+  deliveryJobs DeliveryJob[]
+  contacts     Contact[]
+  linkClicks   LinkClick[]
 
   @@index([workspaceId])
 }
 
 model Automation {
-  id                 String   @id @default(cuid())
+  id                 String      @id @default(cuid())
   workspaceId        String
   instagramAccountId String
 
   name           String
   goal           String?
-  postId         String
+  triggerType    TriggerType @default(COMMENT)
+  triggerScope   String      @default("SPECIFIC_POST")
+  postId         String?
   postUrl        String?
+  consumedPostId String?
+  consumedAt     DateTime?
   keywords       String[]
   dmMessage      String
-  isActive       Boolean @default(true)
-  wholeWordMatch Boolean @default(true)
+  publicReplyMessage String?
+  isActive       Boolean     @default(true)
+  wholeWordMatch Boolean     @default(true)
   reportShareSlug    String? @unique
   reportShareEnabled Boolean @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  instagramAccount InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  workspace        Workspace                     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  instagramAccount InstagramAccount            @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  keywordsList     AutomationKeyword[]
+  variations       AutomationMessageVariation[]
   dmLogs           DmLog[]
+  deliveryJobs     DeliveryJob[]
   trackedLinks     TrackedLink[]
   linkClicks       LinkClick[]
 
   @@index([workspaceId])
-  @@index([instagramAccountId])
-  @@index([postId])
+  @@index([instagramAccountId, postId, isActive])
+  @@index([instagramAccountId, triggerScope, isActive])
+}
+
+model AutomationKeyword {
+  id                String   @id @default(cuid())
+  automationId      String
+  keyword           String
+  normalizedKeyword String
+  createdAt         DateTime @default(now())
+
+  automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+
+  @@unique([automationId, normalizedKeyword])
+  @@index([automationId])
+  @@index([normalizedKeyword])
+}
+
+model AutomationMessageVariation {
+  id           String   @id @default(cuid())
+  automationId String
+  message      String
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  automation   Automation    @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  deliveryJobs DeliveryJob[]
+
+  @@index([automationId])
+}
+
+model Contact {
+  id                 String   @id @default(cuid())
+  workspaceId        String
+  instagramAccountId String
+  instagramUserId    String
+  username           String?
+  displayName        String?
+  profilePicUrl      String?
+  firstSeenAt        DateTime @default(now())
+  lastSeenAt         DateTime @default(now())
+  lastInteractionAt  DateTime @default(now())
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  workspace        Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  instagramAccount InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  events           ContactEvent[]
+  deliveryJobs     DeliveryJob[]
+  linkClicks       LinkClick[]
+
+  @@unique([workspaceId, instagramAccountId, instagramUserId])
+  @@index([workspaceId, lastInteractionAt])
+  @@index([instagramAccountId, lastInteractionAt])
+  @@index([workspaceId, username])
+}
+
+enum ContactEventType {
+  COMMENT
+  DM_SENT
+  PUBLIC_REPLY
+  LINK_CLICK
+  AUTOMATION_TRIGGERED
+}
+
+model ContactEvent {
+  id                 String           @id @default(cuid())
+  workspaceId        String
+  contactId          String
+  instagramAccountId String
+  type               ContactEventType
+  referenceId        String?
+  metadata           Json?
+  createdAt          DateTime         @default(now())
+
+  contact   Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([contactId, createdAt])
+  @@index([workspaceId, createdAt])
+}
+
+model DeliveryJob {
+  id                  String      @id @default(cuid())
+  workspaceId         String
+  instagramAccountId  String
+  automationId        String
+  contactId           String?
+  triggerType         TriggerType @default(COMMENT)
+  triggerId           String
+  recipientId         String
+  recipientUsername   String?
+  status              DmStatus    @default(PENDING)
+  matchedKeyword      String?
+  messagePayload      String
+  selectedVariationId String?
+  attemptCount        Int         @default(0)
+  scheduledAt         DateTime    @default(now())
+  processingStartedAt DateTime?
+  sentAt              DateTime?
+  metaMessageId       String?
+  lastError           String?
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+
+  workspace         Workspace                   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  instagramAccount  InstagramAccount            @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  automation        Automation                  @relation(fields: [automationId], references: [id], onDelete: Cascade)
+  contact           Contact?                    @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  selectedVariation AutomationMessageVariation? @relation(fields: [selectedVariationId], references: [id], onDelete: SetNull)
+  attempts          DeliveryAttempt[]
+  linkClicks        LinkClick[]
+
+  @@unique([automationId, triggerId])
+  @@index([workspaceId, createdAt])
+  @@index([instagramAccountId, status, createdAt])
+  @@index([automationId, createdAt])
+  @@index([status, scheduledAt])
+  @@index([recipientId, createdAt])
+}
+
+model DeliveryAttempt {
+  id            String    @id @default(cuid())
+  deliveryJobId String
+  attemptNumber Int
+  status        DmStatus
+  startedAt     DateTime  @default(now())
+  completedAt   DateTime?
+  metaMessageId String?
+  errorCode     String?
+  errorType     String?
+  errorMessage  String?
+  createdAt     DateTime  @default(now())
+
+  deliveryJob DeliveryJob @relation(fields: [deliveryJobId], references: [id], onDelete: Cascade)
+
+  @@unique([deliveryJobId, attemptNumber])
+  @@index([deliveryJobId])
 }
 
 model DmLog {
@@ -218,6 +369,7 @@ model TrackedLink {
   slug           String   @unique
   label          String?
   destinationUrl String
+  active         Boolean  @default(true)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -235,6 +387,8 @@ model LinkClick {
   automationId       String
   instagramAccountId String
   trackedLinkId      String
+  deliveryJobId      String?
+  contactId          String?
   ipHash             String?
   userAgent          String?
   referrer           String?
@@ -244,29 +398,36 @@ model LinkClick {
   automation       Automation       @relation(fields: [automationId], references: [id], onDelete: Cascade)
   instagramAccount InstagramAccount @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
   trackedLink      TrackedLink      @relation(fields: [trackedLinkId], references: [id], onDelete: Cascade)
+  deliveryJob      DeliveryJob?     @relation(fields: [deliveryJobId], references: [id], onDelete: SetNull)
+  contact          Contact?         @relation(fields: [contactId], references: [id], onDelete: SetNull)
 
   @@index([workspaceId])
   @@index([automationId])
   @@index([instagramAccountId])
   @@index([trackedLinkId])
+  @@index([deliveryJobId])
+  @@index([contactId])
   @@index([createdAt])
   @@index([workspaceId, createdAt])
 }
 
 model WebhookEvent {
-  id          String        @id @default(cuid())
-  workspaceId String?
-  object      String?
-  payload     Json
-  status      WebhookStatus @default(PENDING)
-  errorMessage String?
-  createdAt   DateTime      @default(now())
-  processedAt DateTime?
+  id              String        @id @default(cuid())
+  workspaceId     String?
+  externalEventId String?       @unique
+  eventType       String?
+  object          String?
+  payload         Json
+  status          WebhookStatus @default(PENDING)
+  errorMessage    String?
+  createdAt       DateTime      @default(now())
+  processedAt     DateTime?
 
   workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
 
   @@index([workspaceId])
   @@index([status])
+  @@index([createdAt])
 }
 
 model BillingEvent {
@@ -330,8 +491,14 @@ enum SubscriptionStatus {
 
 enum DmStatus {
   PENDING
+  // Meta API call is in-flight. If a worker sees this on retry it means a prior
+  // attempt may have already sent the DM. Transition → UNKNOWN, do not re-send.
+  SENDING
   SENT
   FAILED
+  // Ambiguous outcome: Meta may or may not have delivered the DM (e.g. network
+  // timeout after request was dispatched). Do NOT retry automatically.
+  UNKNOWN
   SKIPPED_DEDUP
   SKIPPED_RATE_LIMIT
   SKIPPED_PLAN_LIMIT
@@ -339,7 +506,11 @@ enum DmStatus {
 }
 
 enum WebhookStatus {
+  // Webhook received and signature verified; payload persisted.
   PENDING
+  // All comment jobs have been bulk-enqueued into BullMQ.
+  QUEUED
+  // Kept for backward compatibility with rows created before this migration.
   PROCESSED
   FAILED
 }
@@ -355,4 +526,10 @@ enum OperationalEventLevel {
   INFO
   WARNING
   ERROR
+}
+
+enum TriggerType {
+  // Phase 1: comment on a specific post/reel triggers a DM.
+  COMMENT
+  // Future: DM_KEYWORD, STORY_REPLY, etc. — add values here without rewriting the core.
 }
