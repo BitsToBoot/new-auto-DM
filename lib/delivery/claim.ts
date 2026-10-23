@@ -112,16 +112,24 @@ export async function claimDeliveryJob(
   }
 
   if (job.status === "SENDING") {
-    // In-flight from another worker or previous worker crashed mid-dispatch.
-    // Transition to UNKNOWN to prevent duplicate send.
-    await prisma.deliveryJob.update({
-      where: { id: job.id },
-      data: {
-        status: "UNKNOWN",
-        lastError: "Worker crashed or timed out while SENDING in flight; manual review required.",
-      },
-    });
-    return { success: false, reason: "IN_FLIGHT_UNKNOWN", status: "UNKNOWN" };
+    // Check if previous worker crashed/timed out (stuck in SENDING for > 5 minutes)
+    const isStale =
+      job.processingStartedAt &&
+      Date.now() - new Date(job.processingStartedAt).getTime() > 5 * 60 * 1000;
+
+    if (isStale) {
+      await prisma.deliveryJob.update({
+        where: { id: job.id },
+        data: {
+          status: "UNKNOWN",
+          lastError: "Worker crashed or timed out while SENDING in flight; manual review required.",
+        },
+      });
+      return { success: false, reason: "IN_FLIGHT_UNKNOWN", status: "UNKNOWN" };
+    }
+
+    // In-flight from another concurrent worker: abort without overwriting active status
+    return { success: false, reason: "IN_FLIGHT_UNKNOWN", status: "SENDING" };
   }
 
   if (job.status === "FAILED" && job.attemptCount >= 3) {

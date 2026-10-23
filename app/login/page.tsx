@@ -19,7 +19,7 @@ export default async function LoginPage({
   const params = await searchParams;
   const checkEmail = params.checkEmail === "1";
   const authError = params.error;
-  const devMagicLink = checkEmail ? getLastDevMagicLink() : null;
+  const devMagicLink = checkEmail && process.env.NODE_ENV !== "production" ? getLastDevMagicLink() : null;
   const selectedTemplate = getCampaignTemplate(params.template);
   const templateCallbackUrl = selectedTemplate
     ? `/campaigns/new?template=${selectedTemplate.slug}`

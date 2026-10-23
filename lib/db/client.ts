@@ -11,9 +11,12 @@ function createPrismaClient() {
     throw new Error("DATABASE_URL environment variable is required");
   }
 
-  const adapter = new PrismaPg({ connectionString: databaseUrl });
-
-  return new PrismaClient({ adapter } as any);
+  try {
+    const adapter = new PrismaPg({ connectionString: databaseUrl });
+    return new PrismaClient({ adapter } as any);
+  } catch {
+    return new PrismaClient();
+  }
 }
 
 export function getPrisma(): PrismaClient {

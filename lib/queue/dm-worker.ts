@@ -10,7 +10,7 @@ import {
   reserveWorkspaceDMSend,
 } from "@/lib/billing/usage";
 import { recordWorkerAlert } from "@/lib/ops/worker-health";
-import { renderMessageWithTracking } from "@/lib/tracking/message";
+import { renderMessageWithTracking, buildTrackedUrl } from "@/lib/tracking/message";
 import { claimNextPostAutomation } from "@/lib/automation/resolver";
 import { upsertContact, recordContactEvent } from "@/lib/crm/contacts";
 import { claimDeliveryJob } from "@/lib/delivery/claim";
@@ -59,12 +59,19 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
   const requeueAttempt = job.data.requeueAttempt ?? 0;
   const attemptStartedAt = new Date();
 
-  // 1. Primary lookup: SPECIFIC_POST matching this mediaId
+  // 1. Fetch all eligible automations: SPECIFIC_POST, NEXT_POST, ANY_POST
   const automations = await prisma.automation.findMany({
     where: {
-      postId: mediaId,
       isActive: true,
       instagramAccount: { instagramId: instagramAccountId },
+      OR: [
+        { postId: mediaId },
+        { triggerScope: "ANY_POST" },
+        {
+          triggerScope: "NEXT_POST",
+          OR: [{ consumedPostId: null }, { consumedPostId: mediaId }],
+        },
+      ],
     },
     include: {
       instagramAccount: true,
@@ -80,36 +87,6 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
     orderBy: { createdAt: "asc" },
   });
 
-  // 2. Fallback lookup: NEXT_POST or ANY_POST triggers
-  if (automations.length === 0) {
-    const broadAutomations = await prisma.automation.findMany({
-      where: {
-        isActive: true,
-        instagramAccount: { instagramId: instagramAccountId },
-        OR: [
-          { triggerScope: "ANY_POST" },
-          {
-            triggerScope: "NEXT_POST",
-            OR: [{ consumedPostId: null }, { consumedPostId: mediaId }],
-          },
-        ],
-      },
-      include: {
-        instagramAccount: true,
-        workspace: true,
-        trackedLinks: {
-          select: {
-            slug: true,
-            destinationUrl: true,
-          },
-          orderBy: { createdAt: "asc" },
-        },
-      },
-      orderBy: { createdAt: "asc" },
-    });
-    automations.push(...broadAutomations);
-  }
-
   if (automations.length === 0) return;
 
   // 3. RULE: one comment -> one winning automation.
@@ -119,7 +96,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 
   for (const auto of automations) {
     if (auto.triggerScope === "NEXT_POST" && !auto.consumedPostId) {
-      const claimed = await claimNextPostAutomation(auto.id, mediaId).catch(() => true);
+      const claimed = await claimNextPostAutomation(auto.id, mediaId).catch(() => false);
       if (!claimed) continue;
     }
 
@@ -169,6 +146,10 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
   let deliveryJobId: string | null = null;
   let persistedMessagePayload: string | null = null;
   try {
+    const trackedUrl = automation.trackedLinks?.[0]
+      ? buildTrackedUrl(automation.trackedLinks[0].slug)
+      : null;
+
     const claimRes = await claimDeliveryJob({
       workspaceId: automation.workspaceId,
       instagramAccountId: automation.instagramAccountId,
@@ -179,15 +160,17 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       commenterName,
       commentText,
       matchedKeyword,
+      trackedUrl,
     });
     if (claimRes.success) {
       deliveryJobId = claimRes.deliveryJob.id;
       persistedMessagePayload = claimRes.deliveryJob.messagePayload;
-    } else if (claimRes.reason === "ALREADY_COMPLETED" || claimRes.reason === "IN_FLIGHT_UNKNOWN") {
+    } else {
+      // Do not silently fall through from a failed DeliveryJob claim into a second delivery path
       return;
     }
   } catch {
-    // Falls through to DmLog state machine
+    // In mock testing environments where CRM/DeliveryJob tables may be absent, continue cleanly
   }
 
   // 6. DmLog Idempotency Check & Atomic Claim
@@ -286,6 +269,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         errorMessage: "No Instagram access token available",
       },
     });
+    if (deliveryJobId) {
+      await transitionToPermanentFailure(
+        deliveryJobId,
+        job.attemptsMade + 1,
+        "No Instagram access token available",
+        "NO_TOKEN",
+        attemptStartedAt
+      ).catch(() => {});
+    }
     return;
   }
 
@@ -300,6 +292,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         errorMessage: "Failed to decrypt Instagram access token",
       },
     });
+    if (deliveryJobId) {
+      await transitionToPermanentFailure(
+        deliveryJobId,
+        job.attemptsMade + 1,
+        "Failed to decrypt Instagram access token",
+        "DECRYPT_FAILED",
+        attemptStartedAt
+      ).catch(() => {});
+    }
     return;
   }
 
@@ -313,6 +314,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         errorMessage: `Monthly DM limit reached (${usage.limit})`,
       },
     });
+    if (deliveryJobId) {
+      await transitionToPermanentFailure(
+        deliveryJobId,
+        job.attemptsMade + 1,
+        `Monthly DM limit reached (${usage.limit})`,
+        "PLAN_LIMIT",
+        attemptStartedAt
+      ).catch(() => {});
+    }
     return;
   }
 
@@ -326,6 +336,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       where: logWhere(automation.id, commentId),
       data: { status: "FAILED", errorMessage: formatError(error) },
     });
+    if (deliveryJobId) {
+      await transitionToPermanentFailure(
+        deliveryJobId,
+        job.attemptsMade + 1,
+        formatError(error),
+        "RATE_LIMIT_ERROR",
+        attemptStartedAt
+      ).catch(() => {});
+    }
     throw error;
   }
 
@@ -340,6 +359,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: "Hourly Instagram DM rate limit reached; max retries exhausted",
         },
       });
+      if (deliveryJobId) {
+        await transitionToPermanentFailure(
+          deliveryJobId,
+          job.attemptsMade + 1,
+          "Hourly Instagram DM rate limit reached; max retries exhausted",
+          "RATE_LIMIT_EXHAUSTED",
+          attemptStartedAt
+        ).catch(() => {});
+      }
       return;
     }
 
@@ -351,13 +379,22 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           errorMessage: "Hourly rate limit hit; retry scheduled",
         },
       });
+      if (deliveryJobId) {
+        await transitionToRetryable(
+          deliveryJobId,
+          job.attemptsMade + 1,
+          "Hourly rate limit hit; retry scheduled",
+          "RATE_LIMIT_REQUEUE",
+          attemptStartedAt
+        ).catch(() => {});
+      }
 
       await getDMQueue().add(
         "process-comment",
         { ...job.data, requeueAttempt: requeueAttempt + 1 },
         {
           delay: rateLimit.requeueDelayMs,
-          jobId: `comment:${instagramAccountId}:${commentId}:retry:${requeueAttempt + 1}`,
+          jobId: `comment-${instagramAccountId}-${commentId}-retry-${requeueAttempt + 1}`,
         }
       );
       return;
@@ -377,6 +414,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
   if (claim.count === 0) {
     await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
     await releaseDMSlot(instagramAccountId);
+    if (deliveryJobId) {
+      await transitionToPermanentFailure(
+        deliveryJobId,
+        job.attemptsMade + 1,
+        "DmLog claim race lost",
+        "CLAIM_RACE",
+        attemptStartedAt
+      ).catch(() => {});
+    }
     return;
   }
 
@@ -436,9 +482,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       }
     }
   } catch (error) {
-    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-
     if (isAmbiguousError(error)) {
+      // Do not release monthly usage reservation: external send may have succeeded at Meta
       await prisma.dmLog.update({
         where: logWhere(automation.id, commentId),
         data: {
@@ -458,6 +503,8 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
       }
       return;
     }
+
+    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
 
     const metaError = error as MetaApiError;
     if (isPermanentMetaError(metaError)) {

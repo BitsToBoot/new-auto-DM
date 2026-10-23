@@ -44,14 +44,41 @@ async function upsertSubscription(subscription: Stripe.Subscription) {
   const plan = getPlanForPriceId(priceId);
   const subscriptionStatus = mapStripeStatus(subscription.status);
 
-  await prisma.workspace.updateMany({
-    where: {
-      OR: [
-        { id: workspaceId || "__missing_workspace__" },
-        { stripeCustomerId: customerId },
-        { stripeSubscriptionId: subscription.id },
-      ],
-    },
+  // Resolve the target workspace deterministically:
+  // 1. By metadata workspaceId (most authoritative)
+  // 2. By existing stripeSubscriptionId
+  // 3. By existing stripeCustomerId
+  let workspace = workspaceId
+    ? await prisma.workspace.findUnique({ where: { id: workspaceId } })
+    : null;
+
+  if (!workspace) {
+    workspace = await prisma.workspace.findFirst({
+      where: { stripeSubscriptionId: subscription.id },
+    });
+  }
+
+  if (!workspace) {
+    workspace = await prisma.workspace.findFirst({
+      where: { stripeCustomerId: customerId },
+    });
+  }
+
+  if (!workspace) {
+    console.warn(`[stripe-webhook] No workspace found for subscription ${subscription.id}`);
+    return;
+  }
+
+  // Validate consistency: don't let a subscription from one customer update another customer's workspace
+  if (workspace.stripeCustomerId && workspace.stripeCustomerId !== customerId) {
+    console.error(
+      `[stripe-webhook] Customer mismatch: workspace ${workspace.id} has customer ${workspace.stripeCustomerId}, event has ${customerId}`
+    );
+    return;
+  }
+
+  await prisma.workspace.update({
+    where: { id: workspace.id },
     data: {
       plan,
       subscriptionStatus,
@@ -125,13 +152,16 @@ export async function POST(request: NextRequest) {
       ? event.data.object.metadata?.workspaceId
       : undefined;
 
-  await prisma.billingEvent.create({
-    data: {
+  // Atomic idempotency: upsert to handle concurrent duplicate webhooks
+  await prisma.billingEvent.upsert({
+    where: { stripeEventId: event.id },
+    create: {
       workspaceId: workspaceId || null,
       stripeEventId: event.id,
       type: event.type,
       payload: event as unknown as object,
     },
+    update: {},
   });
 
   return NextResponse.json({ received: true });

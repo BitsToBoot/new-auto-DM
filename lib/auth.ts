@@ -40,12 +40,14 @@ export const authConfig = {
       apiKey: process.env.RESEND_API_KEY ?? "missing-resend-api-key",
       from: process.env.EMAIL_FROM ?? "CampaignCue <login@example.com>",
       async sendVerificationRequest({ identifier: to, provider, url }) {
-        setLastDevMagicLink(to, url);
+        if (process.env.NODE_ENV !== "production") {
+          setLastDevMagicLink(to, url);
 
-        console.log("\n============================================================");
-        console.log(`🔗 LOGIN MAGIC LINK for ${to}:`);
-        console.log(url);
-        console.log("============================================================\n");
+          console.log("\n============================================================");
+          console.log(`🔗 LOGIN MAGIC LINK for ${to}:`);
+          console.log(url);
+          console.log("============================================================\n");
+        }
 
         const apiKey = provider.apiKey;
         const isRealKey =

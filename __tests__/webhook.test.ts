@@ -253,9 +253,9 @@ describe("parseCommentEvents", () => {
     expect(firstEvents[0].commentId).toBe("comment_dup");
 
     // Both produce identical BullMQ jobId for deduplication
-    const jobId1 = `comment:${firstEvents[0].instagramAccountId}:${firstEvents[0].commentId}`;
-    const jobId2 = `comment:${secondEvents[0].instagramAccountId}:${secondEvents[0].commentId}`;
+    const jobId1 = `comment-${firstEvents[0].instagramAccountId}-${firstEvents[0].commentId}`;
+    const jobId2 = `comment-${secondEvents[0].instagramAccountId}-${secondEvents[0].commentId}`;
     expect(jobId1).toBe(jobId2);
-    expect(jobId1).toBe("comment:page_123:comment_dup");
+    expect(jobId1).toBe("comment-page_123-comment_dup");
   });
 });

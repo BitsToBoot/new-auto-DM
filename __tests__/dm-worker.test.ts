@@ -211,9 +211,16 @@ describe("DM Worker — Full Pipeline", () => {
 
     expect(mockPrisma.automation.findMany).toHaveBeenCalledWith({
       where: {
-        postId: "media_101",
         isActive: true,
         instagramAccount: { instagramId: "ig_456" },
+        OR: [
+          { postId: "media_101" },
+          { triggerScope: "ANY_POST" },
+          {
+            triggerScope: "NEXT_POST",
+            OR: [{ consumedPostId: null }, { consumedPostId: "media_101" }],
+          },
+        ],
       },
       include: {
         instagramAccount: true,
@@ -333,7 +340,7 @@ describe("DM Worker — Full Pipeline", () => {
       }),
       expect.objectContaining({
         delay: 1800000,
-        jobId: "comment:ig_456:comment_555:retry:1",
+        jobId: "comment-ig_456-comment_555-retry-1",
       })
     );
   });
@@ -395,10 +402,7 @@ describe("DM Worker — Full Pipeline", () => {
     const processor = getProcessor();
     await processor(createMockJob());
 
-    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalledWith(
-      "workspace_123",
-      usagePeriodStart
-    );
+    expect(mockReleaseWorkspaceDMReservation).not.toHaveBeenCalled();
     expect(mockPrisma.dmLog.update).toHaveBeenCalledWith({
       where: {
         automationId_commentId: {

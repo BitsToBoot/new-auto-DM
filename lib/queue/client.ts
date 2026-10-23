@@ -34,14 +34,14 @@ let dmQueue: Queue<ProcessCommentJob> | null = null;
 
 export function getDMQueue(): Queue<ProcessCommentJob> {
   if (!dmQueue) {
-    dmQueue = new Queue<ProcessCommentJob>("dm-processing", {
+    dmQueue = new Queue<ProcessCommentJob>("dm-queue", {
       connection: getRedisConnection(),
       defaultJobOptions: {
         removeOnComplete: { count: 1000 }, // Keep last 1000 completed jobs
         removeOnFail: { count: 5000 }, // Keep last 5000 failed jobs
         attempts: 3,
         backoff: {
-          type: "custom",
+          type: "exponentialish",
         },
       },
     });

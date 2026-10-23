@@ -42,7 +42,25 @@ export async function GET(request: NextRequest) {
  *  - per-event DB queries       (creates sequential blocking under burst)
  */
 export async function POST(request: NextRequest) {
+  // Enforce a 1 MB body size limit to prevent memory exhaustion
+  const contentLength = request.headers.get("content-length");
+  const MAX_BODY_BYTES = 1_048_576; // 1 MB
+  if (contentLength && parseInt(contentLength, 10) > MAX_BODY_BYTES) {
+    return NextResponse.json(
+      { success: false, error: "Payload too large" },
+      { status: 413 }
+    );
+  }
+
   const rawBody = await request.text();
+
+  if (rawBody.length > MAX_BODY_BYTES) {
+    return NextResponse.json(
+      { success: false, error: "Payload too large" },
+      { status: 413 }
+    );
+  }
+
   const signature = request.headers.get("x-hub-signature-256");
 
   if (!verifyWebhookSignature(rawBody, signature)) {
@@ -84,7 +102,7 @@ export async function POST(request: NextRequest) {
         },
         opts: {
           // Stable jobId: BullMQ treats duplicate IDs as no-ops (idempotent enqueue).
-          jobId: `comment:${event.instagramAccountId}:${event.commentId}`,
+          jobId: `comment-${event.instagramAccountId}-${event.commentId}`,
         },
       }))
     );

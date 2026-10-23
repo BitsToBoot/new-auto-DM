@@ -1,8 +1,9 @@
 // CampaignCue — B2B Instagram Comment → DM SaaS schema
 
 generator client {
-  provider = "prisma-client"
-  output   = "../app/generated/prisma"
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+  output          = "../app/generated/prisma"
 }
 
 datasource db {

@@ -162,9 +162,12 @@ export async function getMediaComments(
 ): Promise<InstagramComment[]> {
   const url = new URL(`${instagramGraphBase()}/${mediaId}/comments`);
   url.searchParams.set("fields", "id,text,from,timestamp");
-  url.searchParams.set("access_token", accessToken);
 
-  const response = await fetch(url.toString());
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
   const data = await handleResponse<{ data: InstagramComment[] }>(response);
   return data.data;
 }
@@ -172,9 +175,12 @@ export async function getMediaComments(
 export async function getUserInfo(accessToken: string): Promise<InstagramUser> {
   const url = new URL(`${instagramGraphBase()}/me`);
   url.searchParams.set("fields", "id,username,name");
-  url.searchParams.set("access_token", accessToken);
 
-  const response = await fetch(url.toString());
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
   return handleResponse<InstagramUser>(response);
 }
 
@@ -188,9 +194,12 @@ export async function getUserMedia(
     "id,caption,media_type,media_url,thumbnail_url,timestamp,permalink"
   );
   url.searchParams.set("limit", limit.toString());
-  url.searchParams.set("access_token", accessToken);
 
-  const response = await fetch(url.toString());
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
   const data = await handleResponse<{ data: InstagramMedia[] }>(response);
   return data.data;
 }
