@@ -20,11 +20,11 @@ model User {
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
-  accounts          Account[]
-  sessions          Session[]
-  ownedWorkspaces   Workspace[]       @relation("WorkspaceOwner")
-  workspaceMembers  WorkspaceMember[]
-  sentInvitations   WorkspaceInvitation[] @relation("WorkspaceInvitationsSent")
+  accounts         Account[]
+  sessions         Session[]
+  ownedWorkspaces  Workspace[]           @relation("WorkspaceOwner")
+  workspaceMembers WorkspaceMember[]
+  sentInvitations  WorkspaceInvitation[] @relation("WorkspaceInvitationsSent")
 }
 
 model Account {
@@ -74,14 +74,14 @@ model Workspace {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  plan                 Plan                @default(FREE)
-  subscriptionStatus   SubscriptionStatus  @default(NONE)
-  stripeCustomerId     String?             @unique
-  stripeSubscriptionId String?             @unique
+  plan                 Plan               @default(FREE)
+  subscriptionStatus   SubscriptionStatus @default(NONE)
+  stripeCustomerId     String?            @unique
+  stripeSubscriptionId String?            @unique
   stripePriceId        String?
   currentPeriodEnd     DateTime?
-  usagePeriodStart     DateTime            @default(now())
-  dmsSentThisPeriod    Int                 @default(0)
+  usagePeriodStart     DateTime           @default(now())
+  dmsSentThisPeriod    Int                @default(0)
 
   members           WorkspaceMember[]
   invitations       WorkspaceInvitation[]
@@ -137,16 +137,27 @@ model WorkspaceInvitation {
 }
 
 model InstagramAccount {
-  id                String   @id @default(cuid())
+  id                String    @id @default(cuid())
   workspaceId       String
-  instagramId       String   @unique
+  instagramId       String    @unique
   username          String
   name              String?
+  // Encrypted long-lived token. Cleared to "" when the account is disconnected.
   accessToken       String
   tokenExpiresAt    DateTime?
-  webhookSubscribed Boolean  @default(false)
-  connectedAt       DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  webhookSubscribed Boolean   @default(false)
+  connectedAt       DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  // Lifecycle. Disconnect never deletes the row, so campaigns, deliveries,
+  // contacts and clicks are preserved. Only CONNECTED accounts process comments.
+  status                  InstagramAccountStatus @default(CONNECTED)
+  disconnectedAt          DateTime?
+  disconnectReason        String?
+  // Outcome of the external Meta webhook unsubscription, tracked separately
+  // from the local status so a failure is never reported as success.
+  webhookUnsubscribedAt   DateTime?
+  webhookUnsubscribeError String?
 
   workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   automations  Automation[]
@@ -156,34 +167,41 @@ model InstagramAccount {
   linkClicks   LinkClick[]
 
   @@index([workspaceId])
+  @@index([workspaceId, status])
+}
+
+enum InstagramAccountStatus {
+  CONNECTED
+  DISCONNECTING
+  DISCONNECTED
 }
 
 model Automation {
-  id                 String      @id @default(cuid())
+  id                 String @id @default(cuid())
   workspaceId        String
   instagramAccountId String
 
-  name           String
-  goal           String?
-  triggerType    TriggerType @default(COMMENT)
-  triggerScope   String      @default("SPECIFIC_POST")
-  postId         String?
-  postUrl        String?
-  consumedPostId String?
-  consumedAt     DateTime?
-  keywords       String[]
-  dmMessage      String
+  name               String
+  goal               String?
+  triggerType        TriggerType @default(COMMENT)
+  triggerScope       String      @default("SPECIFIC_POST")
+  postId             String?
+  postUrl            String?
+  consumedPostId     String?
+  consumedAt         DateTime?
+  keywords           String[]
+  dmMessage          String
   publicReplyMessage String?
-  isActive       Boolean     @default(true)
-  wholeWordMatch Boolean     @default(true)
-  reportShareSlug    String? @unique
-  reportShareEnabled Boolean @default(true)
+  isActive           Boolean     @default(true)
+  wholeWordMatch     Boolean     @default(true)
+  reportShareSlug    String?     @unique
+  reportShareEnabled Boolean     @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  workspace        Workspace                     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
-  instagramAccount InstagramAccount            @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
+  workspace        Workspace                    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  instagramAccount InstagramAccount             @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
   keywordsList     AutomationKeyword[]
   variations       AutomationMessageVariation[]
   dmLogs           DmLog[]
@@ -287,16 +305,36 @@ model DeliveryJob {
   recipientUsername   String?
   status              DmStatus    @default(PENDING)
   matchedKeyword      String?
+  // Fully rendered message (placeholders + tracked URL) persisted BEFORE any
+  // send so retries always deliver exactly the same text.
   messagePayload      String
   selectedVariationId String?
   attemptCount        Int         @default(0)
+  // Earliest time the job may be (re)attempted. PENDING jobs with
+  // scheduledAt <= now are picked up by the durable scheduler.
   scheduledAt         DateTime    @default(now())
   processingStartedAt DateTime?
   sentAt              DateTime?
   metaMessageId       String?
   lastError           String?
+  errorCode           String?
   createdAt           DateTime    @default(now())
   updatedAt           DateTime    @updatedAt
+
+  // Comment context (canonical replacement for DmLog fields).
+  mediaId              String?
+  commentText          String?
+  commentedAt          DateTime?
+  // Private-reply eligibility deadline (comment time + Meta window - margin).
+  deadlineAt           DateTime?
+  rateLimitDeferrals   Int       @default(0)
+  // "<automationId>:<recipientId>" while the job is PENDING/SENDING/SENT/UNKNOWN,
+  // NULL otherwise. The unique index makes "DM each user once per campaign"
+  // a database-enforced invariant instead of a racy read-then-write.
+  dedupKey             String?   @unique
+  dedupOfDeliveryJobId String?
+  // Set for rows backfilled from the legacy DmLog table (repeatable backfill).
+  legacyDmLogId        String?   @unique
 
   workspace         Workspace                   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   instagramAccount  InstagramAccount            @relation(fields: [instagramAccountId], references: [id], onDelete: Cascade)
@@ -311,7 +349,10 @@ model DeliveryJob {
   @@index([instagramAccountId, status, createdAt])
   @@index([automationId, createdAt])
   @@index([status, scheduledAt])
+  @@index([status, deadlineAt])
   @@index([recipientId, createdAt])
+  @@index([workspaceId, status, createdAt])
+  @@index([workspaceId, sentAt])
 }
 
 model DeliveryAttempt {
@@ -333,21 +374,25 @@ model DeliveryAttempt {
   @@index([deliveryJobId])
 }
 
+// DEPRECATED: DeliveryJob is the canonical delivery record. DmLog is no longer
+// written or read by the application. Historical rows were backfilled into
+// DeliveryJob (see lib/delivery/backfill.ts). The table is kept until a later
+// migration retires it after the backfill has been verified in production.
 model DmLog {
-  id                 String     @id @default(cuid())
+  id                 String @id @default(cuid())
   workspaceId        String
   automationId       String
   instagramAccountId String
 
-  commenterId   String
-  commenterName String?
-  commentText   String
-  commentId     String
+  commenterId    String
+  commenterName  String?
+  commentText    String
+  commentId      String
   matchedKeyword String?
-  status        DmStatus @default(PENDING)
-  attempts      Int      @default(0)
-  dmSentAt      DateTime?
-  errorMessage  String?
+  status         DmStatus  @default(PENDING)
+  attempts       Int       @default(0)
+  dmSentAt       DateTime?
+  errorMessage   String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -412,6 +457,36 @@ model LinkClick {
   @@index([workspaceId, createdAt])
 }
 
+// Durable per-comment intake record written by the webhook BEFORE the comment is
+// enqueued. Provides comment-level idempotency and lets the scheduler recover
+// comments whose queue jobs were lost (Redis restart, worker crash).
+model InboundComment {
+  id                 String               @id @default(cuid())
+  // Instagram account ID from the webhook entry (not a foreign key: the
+  // account may be unknown or disconnected).
+  instagramAccountId String
+  commentId          String
+  mediaId            String
+  commenterId        String
+  commenterUsername  String?
+  commentText        String
+  commentedAt        DateTime
+  status             InboundCommentStatus @default(RECEIVED)
+  outcome            String?
+  attempts           Int                  @default(0)
+  receivedAt         DateTime             @default(now())
+  processedAt        DateTime?
+
+  @@unique([instagramAccountId, commentId])
+  @@index([status, receivedAt])
+}
+
+enum InboundCommentStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+}
+
 model WebhookEvent {
   id              String        @id @default(cuid())
   workspaceId     String?
@@ -432,12 +507,12 @@ model WebhookEvent {
 }
 
 model BillingEvent {
-  id          String   @id @default(cuid())
-  workspaceId String?
-  stripeEventId String @unique
-  type        String
-  payload     Json
-  processedAt DateTime @default(now())
+  id            String   @id @default(cuid())
+  workspaceId   String?
+  stripeEventId String   @unique
+  type          String
+  payload       Json
+  processedAt   DateTime @default(now())
 
   workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
 
@@ -445,13 +520,13 @@ model BillingEvent {
 }
 
 model OperationalEvent {
-  id          String                @id @default(cuid())
+  id          String                 @id @default(cuid())
   workspaceId String?
   source      OperationalEventSource
-  level       OperationalEventLevel @default(INFO)
+  level       OperationalEventLevel  @default(INFO)
   message     String
   payload     Json?
-  createdAt   DateTime              @default(now())
+  createdAt   DateTime               @default(now())
   resolvedAt  DateTime?
 
   workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
@@ -504,6 +579,8 @@ enum DmStatus {
   SKIPPED_RATE_LIMIT
   SKIPPED_PLAN_LIMIT
   SKIPPED_NO_MATCH
+  // The private-reply eligibility window closed before the DM could be sent.
+  EXPIRED
 }
 
 enum WebhookStatus {

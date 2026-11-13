@@ -1,588 +1,699 @@
 import { Worker, type Job } from "bullmq";
-import { getDMQueue, getRedisConnection, type ProcessCommentJob } from "./client";
+import {
+  getRedisConnection,
+  isDeliverJob,
+  type DMQueueJobData,
+  type ProcessCommentJob,
+} from "./client";
 import { prisma } from "@/lib/db/client";
-import { MetaApiError, sendPrivateReply, replyToComment } from "@/lib/meta/client";
+import {
+  MetaApiError,
+  MetaNetworkError,
+  PERMANENT_META_ERROR_CODES,
+  RateLimitError,
+  getMediaPublishedAt,
+  replyToComment,
+  sendPrivateReply,
+} from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
-import { matchKeywords } from "@/lib/utils/keyword-matcher";
 import { releaseDMSlot, reserveDMSlot } from "@/lib/utils/rate-limiter";
 import {
   releaseWorkspaceDMReservation,
   reserveWorkspaceDMSend,
 } from "@/lib/billing/usage";
 import { recordWorkerAlert } from "@/lib/ops/worker-health";
-import { renderMessageWithTracking, buildTrackedUrl } from "@/lib/tracking/message";
-import { claimNextPostAutomation } from "@/lib/automation/resolver";
+import { logEvent, describeError } from "@/lib/ops/logger";
+import { resolveAutomationForComment } from "@/lib/automation/resolver";
 import { upsertContact, recordContactEvent } from "@/lib/crm/contacts";
-import { claimDeliveryJob } from "@/lib/delivery/claim";
+import { createDeliveryJobForComment } from "@/lib/delivery/intake";
 import {
-  transitionToSent,
-  transitionToPermanentFailure,
-  transitionToRetryable,
-  transitionToUnknown,
+  assertWithinMetaLimit,
+  findPlaceholders,
+  MessageRenderError,
+} from "@/lib/delivery/renderer";
+import {
+  claimForSending,
+  closePending,
+  deferPending,
+  markFailedAfterSend,
+  markSent,
+  markUnknown,
+  rescheduleAfterAttempt,
 } from "@/lib/delivery/state";
+import { enqueueDelivery } from "@/lib/delivery/scheduler";
+import { DELIVERY_CONFIG, computeBackoffMs } from "@/lib/config/delivery";
 
-// Exponential backoff delays for BullMQ retries (ms).
-const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
+/**
+ * DM worker.
+ *
+ * Intake (`process-comment`): durable per-comment idempotency (InboundComment),
+ * account lifecycle and creator self-comment checks, canonical campaign
+ * resolution, then creation of the canonical DeliveryJob. No Meta send happens
+ * unless that DeliveryJob row exists.
+ *
+ * Delivery (`deliver`): loads a PENDING DeliveryJob, enforces deadline,
+ * account, campaign, message and token checks, reserves throughput and plan
+ * usage, atomically claims PENDING -> SENDING, sends through the Meta adapter
+ * and persists the result. Failures fail closed:
+ *  - Definite rejection (Meta rate limit / transient error / no connection):
+ *    rescheduled durably in PostgreSQL with backoff, bounded by the deadline.
+ *  - Ambiguous outcome (timeout, reset, unreadable response): UNKNOWN, never
+ *    retried automatically.
+ *  - Crash after the send but before persistence: the job stays SENDING and the
+ *    scheduler moves it to UNKNOWN; it is never re-sent.
+ */
 
-function logWhere(automationId: string, commentId: string) {
-  return { automationId_commentId: { automationId, commentId } } as const;
+// Backoff for BullMQ-level retries of infrastructure errors (DB/Redis
+// unavailable before any send). Delivery retries are rescheduled in PostgreSQL.
+const BACKOFF_DELAYS = [30 * 1000, 2 * 60 * 1000, 10 * 60 * 1000];
+
+const PERSIST_AFTER_SEND_RETRIES = 3;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+const mediaPublishedAtCache = new Map<string, Date>();
+const MEDIA_CACHE_LIMIT = 5000;
+
+async function getCachedMediaPublishedAt(accessToken: string, mediaId: string): Promise<Date | null> {
+  const cached = mediaPublishedAtCache.get(mediaId);
+  if (cached) return cached;
+
+  try {
+    const publishedAt = await getMediaPublishedAt(accessToken, mediaId);
+    if (mediaPublishedAtCache.size >= MEDIA_CACHE_LIMIT) {
+      const oldest = mediaPublishedAtCache.keys().next().value;
+      if (oldest !== undefined) mediaPublishedAtCache.delete(oldest);
+    }
+    mediaPublishedAtCache.set(mediaId, publishedAt);
+    return publishedAt;
+  } catch (error) {
+    // A permanent Meta error means the publish time is unknowable: NEXT_POST
+    // is simply ineligible. Anything else is transient: throw so the comment
+    // is retried rather than resolved to a different winner.
+    if (error instanceof MetaApiError && PERMANENT_META_ERROR_CODES.has(error.code)) {
+      logEvent("warn", "intake.media_timestamp_unavailable", {
+        mediaId,
+        metaCode: error.code,
+      });
+      return null;
+    }
+    throw error;
+  }
+}
+
+/** Test hook. */
+export function clearMediaPublishedAtCache() {
+  mediaPublishedAtCache.clear();
 }
 
 function formatError(error: unknown): string {
-  if (error instanceof MetaApiError) {
-    return `Meta API ${error.code}: ${error.message}`;
-  }
+  if (error instanceof MetaApiError) return `Meta API ${error.code}: ${error.message}`;
   if (error instanceof Error) return error.message;
   return "Unknown error";
 }
 
-function isAmbiguousError(error: unknown): boolean {
-  return !(error instanceof MetaApiError);
+/** Releases a reservation; a failure here must not mask the primary outcome. */
+async function releaseSafely(label: string, ids: Record<string, unknown>, release: () => Promise<unknown>) {
+  try {
+    await release();
+  } catch (error) {
+    logEvent("error", "delivery.reservation_release_failed", {
+      reservation: label,
+      ...ids,
+      error: describeError(error),
+    });
+  }
 }
 
-function isPermanentMetaError(error: MetaApiError): boolean {
-  // 190 = invalid/expired token; 10 / 200 = permission error; 100 = param error
-  return [190, 10, 200, 100].includes(error.code);
+/** Non-critical bookkeeping after the canonical state is already durable. */
+async function bestEffort(label: string, ids: Record<string, unknown>, action: () => Promise<unknown>) {
+  try {
+    await action();
+  } catch (error) {
+    logEvent("warn", `delivery.${label}_failed`, { ...ids, error: describeError(error) });
+  }
 }
 
-// ---------------------------------------------------------------------------
-
-async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
-  const {
-    instagramAccountId,
-    commentId,
-    commentText,
-    commenterId,
-    commenterName,
-    mediaId,
-  } = job.data;
-  const requeueAttempt = job.data.requeueAttempt ?? 0;
-  const attemptStartedAt = new Date();
-
-  // 1. Fetch all eligible automations: SPECIFIC_POST, NEXT_POST, ANY_POST
-  const automations = await prisma.automation.findMany({
-    where: {
-      isActive: true,
-      instagramAccount: { instagramId: instagramAccountId },
-      OR: [
-        { postId: mediaId },
-        { triggerScope: "ANY_POST" },
-        {
-          triggerScope: "NEXT_POST",
-          OR: [{ consumedPostId: null }, { consumedPostId: mediaId }],
-        },
-      ],
-    },
-    include: {
-      instagramAccount: true,
-      workspace: true,
-      trackedLinks: {
-        select: {
-          slug: true,
-          destinationUrl: true,
-        },
-        orderBy: { createdAt: "asc" },
-      },
-    },
-    orderBy: { createdAt: "asc" },
-  });
-
-  if (automations.length === 0) return;
-
-  // 3. RULE: one comment -> one winning automation.
-  // Evaluate keywords and NEXT_POST consumption.
-  let matchedAutomation: (typeof automations)[0] | null = null;
-  let matchedKeywordStr: string | null = null;
-
-  for (const auto of automations) {
-    if (auto.triggerScope === "NEXT_POST" && !auto.consumedPostId) {
-      const claimed = await claimNextPostAutomation(auto.id, mediaId).catch(() => false);
-      if (!claimed) continue;
-    }
-
-    const { matched, matchedKeyword } = matchKeywords(
-      commentText,
-      auto.keywords,
-      auto.wholeWordMatch
-    );
-
-    if (matched && matchedKeyword) {
-      matchedAutomation = auto;
-      matchedKeywordStr = matchedKeyword;
-      break;
+async function withPersistRetries<T>(action: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < PERSIST_AFTER_SEND_RETRIES; attempt++) {
+    try {
+      return await action();
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 50 * 2 ** attempt));
     }
   }
+  throw lastError;
+}
 
-  if (!matchedAutomation || !matchedKeywordStr) return;
+function jitterMs(maxMs: number) {
+  return Math.floor(Math.random() * maxMs);
+}
 
-  const automation = matchedAutomation;
-  const matchedKeyword = matchedKeywordStr;
+// ─── Intake ──────────────────────────────────────────────────────────────────
 
-  // 4. CRM Contact Upsert (non-blocking if mock environment)
-  let contactId: string | null = null;
-  try {
-    const contact = await upsertContact({
-      workspaceId: automation.workspaceId,
-      instagramAccountId: automation.instagramAccountId,
-      instagramUserId: commenterId,
-      username: commenterName,
-      displayName: commenterName,
+export type IntakeOutcome =
+  | "ALREADY_PROCESSED"
+  | "UNKNOWN_ACCOUNT"
+  | "ACCOUNT_NOT_CONNECTED"
+  | "MISSING_COMMENTER_ID"
+  | "SELF_COMMENT"
+  | "NO_MATCHING_CAMPAIGN"
+  | "CREATED"
+  | "EXISTING"
+  | "DEDUPLICATED"
+  | "INVALID_MESSAGE"
+  | "EXPIRED";
+
+function isValidInstagramId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+
+export async function processCommentJob(
+  data: ProcessCommentJob,
+  options: { deliverInline?: boolean } = {}
+): Promise<IntakeOutcome> {
+  const deliverInline = options.deliverInline ?? true;
+  const commentedAt = data.commentedAt ? new Date(data.commentedAt) : new Date();
+  const ids = { instagramAccountId: data.instagramAccountId, commentId: data.commentId };
+
+  // Durable per-comment idempotency. The webhook normally creates this row;
+  // jobs enqueued before the InboundComment table existed create it here.
+  const inbound = await prisma.inboundComment.upsert({
+    where: {
+      instagramAccountId_commentId: {
+        instagramAccountId: data.instagramAccountId,
+        commentId: data.commentId,
+      },
+    },
+    create: {
+      instagramAccountId: data.instagramAccountId,
+      commentId: data.commentId,
+      mediaId: data.mediaId,
+      commenterId: typeof data.commenterId === "string" ? data.commenterId : "",
+      commenterUsername: data.commenterName ?? null,
+      commentText: data.commentText ?? "",
+      commentedAt: Number.isFinite(commentedAt.getTime()) ? commentedAt : new Date(),
+    },
+    update: {},
+  });
+
+  if (inbound.status !== "RECEIVED") return "ALREADY_PROCESSED";
+
+  const finish = async (status: "PROCESSED" | "IGNORED", outcome: IntakeOutcome) => {
+    await prisma.inboundComment.updateMany({
+      where: { id: inbound.id, status: "RECEIVED" },
+      data: { status, outcome, processedAt: new Date() },
     });
-    contactId = contact.id;
+    if (status === "IGNORED") logEvent("info", "intake.comment_ignored", { ...ids, outcome });
+    return outcome;
+  };
 
+  const account = await prisma.instagramAccount.findUnique({
+    where: { instagramId: data.instagramAccountId },
+  });
+  if (!account) return finish("IGNORED", "UNKNOWN_ACCOUNT");
+  if (account.status !== "CONNECTED") return finish("IGNORED", "ACCOUNT_NOT_CONNECTED");
+
+  if (!isValidInstagramId(data.commenterId)) {
+    return finish("IGNORED", "MISSING_COMMENTER_ID");
+  }
+
+  // Creator's own comment: compare stable Instagram user IDs, never usernames.
+  // The webhook entry ID is the receiving account in the same ID space as
+  // `from.id`; the stored account ID is checked as well.
+  if (data.commenterId === data.instagramAccountId || data.commenterId === account.instagramId) {
+    return finish("IGNORED", "SELF_COMMENT");
+  }
+
+  let decryptedToken: string | null | undefined;
+  const resolved = await resolveAutomationForComment({
+    instagramAccountId: account.id,
+    mediaId: data.mediaId,
+    commentText: data.commentText ?? "",
+    getMediaPublishedAt: async () => {
+      if (decryptedToken === undefined) {
+        try {
+          decryptedToken = account.accessToken ? decryptToken(account.accessToken) : null;
+        } catch (error) {
+          logEvent("error", "intake.token_decrypt_failed", { ...ids, error: describeError(error) });
+          decryptedToken = null;
+        }
+      }
+      return decryptedToken ? getCachedMediaPublishedAt(decryptedToken, data.mediaId) : null;
+    },
+  });
+
+  if (!resolved) return finish("IGNORED", "NO_MATCHING_CAMPAIGN");
+
+  const { automation, matchedKeyword } = resolved;
+  const contact = await upsertContact({
+    workspaceId: automation.workspaceId,
+    instagramAccountId: account.id,
+    instagramUserId: data.commenterId,
+    username: data.commenterName,
+    displayName: data.commenterName,
+  });
+
+  const result = await createDeliveryJobForComment({
+    workspaceId: automation.workspaceId,
+    instagramAccountId: account.id,
+    automation,
+    contactId: contact.id,
+    commentId: data.commentId,
+    commenterId: data.commenterId,
+    commenterName: data.commenterName,
+    commentText: data.commentText ?? "",
+    mediaId: data.mediaId,
+    matchedKeyword,
+    commentedAt: inbound.commentedAt,
+  });
+
+  if (result.outcome !== "EXISTING") {
     await recordContactEvent({
       workspaceId: automation.workspaceId,
       contactId: contact.id,
-      instagramAccountId: automation.instagramAccountId,
+      instagramAccountId: account.id,
       type: "AUTOMATION_TRIGGERED",
-      referenceId: commentId,
-      metadata: { mediaId, matchedKeyword },
-    });
-  } catch {
-    // In mock testing environments where CRM tables may be absent, continue cleanly
-  }
-
-  // 5. DeliveryJob Claim & Variation Persistence
-  let deliveryJobId: string | null = null;
-  let persistedMessagePayload: string | null = null;
-  try {
-    const trackedUrl = automation.trackedLinks?.[0]
-      ? buildTrackedUrl(automation.trackedLinks[0].slug)
-      : null;
-
-    const claimRes = await claimDeliveryJob({
-      workspaceId: automation.workspaceId,
-      instagramAccountId: automation.instagramAccountId,
-      automation: automation as any,
-      contactId,
-      commentId,
-      commenterId,
-      commenterName,
-      commentText,
-      matchedKeyword,
-      trackedUrl,
-    });
-    if (claimRes.success) {
-      deliveryJobId = claimRes.deliveryJob.id;
-      persistedMessagePayload = claimRes.deliveryJob.messagePayload;
-    } else {
-      // Do not silently fall through from a failed DeliveryJob claim into a second delivery path
-      return;
-    }
-  } catch {
-    // In mock testing environments where CRM/DeliveryJob tables may be absent, continue cleanly
-  }
-
-  // 6. DmLog Idempotency Check & Atomic Claim
-  const existingLog = await prisma.dmLog.findUnique({
-    where: logWhere(automation.id, commentId),
-  });
-
-  if (existingLog) {
-    const { status } = existingLog;
-    if (
-      status === "SENT" ||
-      status === "SKIPPED_DEDUP" ||
-      status === "SKIPPED_PLAN_LIMIT" ||
-      status === "SKIPPED_RATE_LIMIT" ||
-      status === "SKIPPED_NO_MATCH" ||
-      status === "UNKNOWN"
-    ) {
-      return;
-    }
-
-    if (status === "SENDING") {
-      await prisma.dmLog.update({
-        where: logWhere(automation.id, commentId),
-        data: {
-          status: "UNKNOWN",
-          errorMessage:
-            "Prior attempt reached Meta API but outcome was not confirmed. Manual review required.",
-        },
-      });
-      return;
-    }
-
-    if (status === "FAILED") {
-      const reset = await prisma.dmLog.updateMany({
-        where: {
-          automationId: automation.id,
-          commentId,
-          status: "FAILED",
-        },
-        data: {
-          status: "PENDING",
-          attempts: job.attemptsMade + 1,
-          matchedKeyword,
-          errorMessage: null,
-        },
-      });
-      if (reset.count === 0) {
-        return;
-      }
-    }
-  } else {
-    try {
-      await prisma.dmLog.create({
-        data: {
-          workspaceId: automation.workspaceId,
-          automationId: automation.id,
-          instagramAccountId: automation.instagramAccountId,
-          commenterId,
-          commenterName,
-          commentText,
-          commentId,
-          matchedKeyword,
-          status: "PENDING",
-          attempts: job.attemptsMade + 1,
-          errorMessage: null,
-        },
-      });
-    } catch (createErr: unknown) {
-      const isUniqueViolation =
-        (typeof createErr === "object" &&
-          createErr !== null &&
-          "code" in createErr &&
-          (createErr as { code: string }).code === "P2002") ||
-        (createErr instanceof Error &&
-          createErr.message.includes("Unique constraint"));
-
-      if (isUniqueViolation) {
-        const recheck = await prisma.dmLog.findUnique({
-          where: logWhere(automation.id, commentId),
-        });
-        if (!recheck || recheck.status !== "PENDING") {
-          return;
-        }
-      } else {
-        throw createErr;
-      }
-    }
-  }
-
-  // 7. Token guard
-  if (!automation.instagramAccount.accessToken) {
-    await prisma.dmLog.update({
-      where: logWhere(automation.id, commentId),
-      data: {
-        status: "FAILED",
-        errorMessage: "No Instagram access token available",
+      referenceId: data.commentId,
+      metadata: {
+        mediaId: data.mediaId,
+        matchedKeyword,
+        deliveryJobId: result.job.id,
+        outcome: result.outcome,
       },
     });
-    if (deliveryJobId) {
-      await transitionToPermanentFailure(
-        deliveryJobId,
-        job.attemptsMade + 1,
-        "No Instagram access token available",
-        "NO_TOKEN",
-        attemptStartedAt
-      ).catch(() => {});
+  }
+
+  if (result.outcome === "DEDUPLICATED") {
+    logEvent("info", "intake.recipient_deduplicated", {
+      ...ids,
+      deliveryJobId: result.job.id,
+      existingDeliveryJobId: result.existingJobId,
+    });
+  } else if (result.outcome === "INVALID_MESSAGE" || result.outcome === "EXPIRED") {
+    logEvent("warn", "intake.delivery_not_sendable", {
+      ...ids,
+      deliveryJobId: result.job.id,
+      outcome: result.outcome,
+      errorCode: result.job.errorCode,
+    });
+  }
+
+  await finish("PROCESSED", result.outcome);
+
+  if (deliverInline && result.job.status === "PENDING") {
+    await deliverDeliveryJob(result.job.id);
+  }
+
+  return result.outcome;
+}
+
+// ─── Delivery ────────────────────────────────────────────────────────────────
+
+export type DeliveryOutcome =
+  | "NOT_FOUND"
+  | "NOT_PENDING"
+  | "NOT_DUE"
+  | "EXPIRED"
+  | "ACCOUNT_DISCONNECTED"
+  | "CAMPAIGN_INACTIVE"
+  | "INVALID_MESSAGE"
+  | "NO_TOKEN"
+  | "DECRYPT_FAILED"
+  | "RATE_LIMIT_DEFERRED"
+  | "PLAN_LIMIT"
+  | "CLAIM_LOST"
+  | "SENT"
+  | "UNKNOWN"
+  | "FAILED"
+  | "RESCHEDULED";
+
+async function enqueueOrLog(job: { id: string; scheduledAt: Date; deadlineAt: Date | null }) {
+  try {
+    await enqueueDelivery(job);
+  } catch (error) {
+    // The job is durably PENDING in PostgreSQL; the scheduler will enqueue it.
+    logEvent("warn", "delivery.enqueue_failed_scheduler_will_recover", {
+      deliveryJobId: job.id,
+      error: describeError(error),
+    });
+  }
+}
+
+export async function deliverDeliveryJob(deliveryJobId: string): Promise<DeliveryOutcome> {
+  const job = await prisma.deliveryJob.findUnique({
+    where: { id: deliveryJobId },
+    include: {
+      instagramAccount: true,
+      automation: { select: { id: true, isActive: true, publicReplyMessage: true } },
+    },
+  });
+
+  if (!job) {
+    logEvent("warn", "delivery.job_not_found", { deliveryJobId });
+    return "NOT_FOUND";
+  }
+  if (job.status !== "PENDING") return "NOT_PENDING";
+
+  const ids = {
+    deliveryJobId: job.id,
+    workspaceId: job.workspaceId,
+    automationId: job.automationId,
+    commentId: job.triggerId,
+  };
+  const now = new Date();
+
+  if (job.scheduledAt.getTime() > now.getTime() + 1000) {
+    await enqueueOrLog(job);
+    return "NOT_DUE";
+  }
+
+  if (job.deadlineAt && job.deadlineAt.getTime() <= now.getTime()) {
+    await closePending(
+      job.id,
+      "EXPIRED",
+      "Private-reply eligibility window closed before the DM could be sent",
+      "DEADLINE_PASSED"
+    );
+    return "EXPIRED";
+  }
+
+  const account = job.instagramAccount;
+  if (account.status !== "CONNECTED") {
+    await closePending(job.id, "FAILED", "Instagram account is disconnected", "ACCOUNT_DISCONNECTED");
+    return "ACCOUNT_DISCONNECTED";
+  }
+
+  if (!job.automation.isActive) {
+    await closePending(job.id, "FAILED", "Campaign was paused before the DM was sent", "CAMPAIGN_INACTIVE");
+    return "CAMPAIGN_INACTIVE";
+  }
+
+  // Never send unresolved placeholders or over-limit text (also covers rows
+  // rendered by older code before canonical rendering existed).
+  try {
+    if (!job.messagePayload.trim()) {
+      throw new MessageRenderError("EMPTY_MESSAGE", "Delivery has no rendered message");
     }
-    return;
+    const leftover = findPlaceholders(job.messagePayload);
+    if (leftover.length > 0) {
+      throw new MessageRenderError(
+        "UNSUPPORTED_PLACEHOLDER",
+        `Rendered message still contains placeholder(s): ${leftover.map((p) => `{${p}}`).join(", ")}`
+      );
+    }
+    assertWithinMetaLimit(job.messagePayload);
+  } catch (error) {
+    if (!(error instanceof MessageRenderError)) throw error;
+    await closePending(job.id, "FAILED", error.message, error.code);
+    return "INVALID_MESSAGE";
+  }
+
+  if (!account.accessToken) {
+    await closePending(job.id, "FAILED", "No Instagram access token available", "NO_TOKEN");
+    return "NO_TOKEN";
   }
 
   let accessToken: string;
   try {
-    accessToken = decryptToken(automation.instagramAccount.accessToken);
+    accessToken = decryptToken(account.accessToken);
   } catch {
-    await prisma.dmLog.update({
-      where: logWhere(automation.id, commentId),
-      data: {
-        status: "FAILED",
-        errorMessage: "Failed to decrypt Instagram access token",
-      },
-    });
-    if (deliveryJobId) {
-      await transitionToPermanentFailure(
-        deliveryJobId,
-        job.attemptsMade + 1,
-        "Failed to decrypt Instagram access token",
-        "DECRYPT_FAILED",
-        attemptStartedAt
-      ).catch(() => {});
-    }
-    return;
+    await closePending(job.id, "FAILED", "Failed to decrypt Instagram access token", "DECRYPT_FAILED");
+    return "DECRYPT_FAILED";
   }
 
-  // 8. Monthly plan quota check
-  const usage = await reserveWorkspaceDMSend(automation.workspaceId);
-  if (!usage.allowed) {
-    await prisma.dmLog.update({
-      where: logWhere(automation.id, commentId),
-      data: {
-        status: "SKIPPED_PLAN_LIMIT",
-        errorMessage: `Monthly DM limit reached (${usage.limit})`,
-      },
-    });
-    if (deliveryJobId) {
-      await transitionToPermanentFailure(
-        deliveryJobId,
-        job.attemptsMade + 1,
-        `Monthly DM limit reached (${usage.limit})`,
-        "PLAN_LIMIT",
-        attemptStartedAt
-      ).catch(() => {});
+  // Our own throughput limit. Blocked => defer durably until the window resets.
+  const slot = await reserveDMSlot(account.instagramId);
+  if (!slot.allowed) {
+    const scheduledAt = new Date(now.getTime() + slot.requeueDelayMs + jitterMs(30_000));
+    if (await deferPending(job.id, scheduledAt, "Hourly DM throughput limit reached; deferred until the window resets")) {
+      await enqueueOrLog({ id: job.id, scheduledAt, deadlineAt: job.deadlineAt });
     }
-    return;
+    return "RATE_LIMIT_DEFERRED";
   }
 
-  // 9. Hourly rate limit check
-  let rateLimit;
+  const releaseSlot = () =>
+    releaseSafely("rate_slot", ids, () => releaseDMSlot(account.instagramId));
+
+  let usage: Awaited<ReturnType<typeof reserveWorkspaceDMSend>>;
   try {
-    rateLimit = await reserveDMSlot(instagramAccountId, requeueAttempt);
+    usage = await reserveWorkspaceDMSend(job.workspaceId);
   } catch (error) {
-    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-    await prisma.dmLog.update({
-      where: logWhere(automation.id, commentId),
-      data: { status: "FAILED", errorMessage: formatError(error) },
-    });
-    if (deliveryJobId) {
-      await transitionToPermanentFailure(
-        deliveryJobId,
-        job.attemptsMade + 1,
-        formatError(error),
-        "RATE_LIMIT_ERROR",
-        attemptStartedAt
-      ).catch(() => {});
-    }
+    await releaseSlot();
     throw error;
   }
-
-  if (!rateLimit.allowed) {
-    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-
-    if (rateLimit.shouldSkip) {
-      await prisma.dmLog.update({
-        where: logWhere(automation.id, commentId),
-        data: {
-          status: "SKIPPED_RATE_LIMIT",
-          errorMessage: "Hourly Instagram DM rate limit reached; max retries exhausted",
-        },
-      });
-      if (deliveryJobId) {
-        await transitionToPermanentFailure(
-          deliveryJobId,
-          job.attemptsMade + 1,
-          "Hourly Instagram DM rate limit reached; max retries exhausted",
-          "RATE_LIMIT_EXHAUSTED",
-          attemptStartedAt
-        ).catch(() => {});
-      }
-      return;
-    }
-
-    if (rateLimit.shouldRequeue) {
-      await prisma.dmLog.update({
-        where: logWhere(automation.id, commentId),
-        data: {
-          status: "PENDING",
-          errorMessage: "Hourly rate limit hit; retry scheduled",
-        },
-      });
-      if (deliveryJobId) {
-        await transitionToRetryable(
-          deliveryJobId,
-          job.attemptsMade + 1,
-          "Hourly rate limit hit; retry scheduled",
-          "RATE_LIMIT_REQUEUE",
-          attemptStartedAt
-        ).catch(() => {});
-      }
-
-      await getDMQueue().add(
-        "process-comment",
-        { ...job.data, requeueAttempt: requeueAttempt + 1 },
-        {
-          delay: rateLimit.requeueDelayMs,
-          jobId: `comment-${instagramAccountId}-${commentId}-retry-${requeueAttempt + 1}`,
-        }
-      );
-      return;
-    }
-  }
-
-  // 10. Atomic delivery claim: PENDING -> SENDING
-  const claim = await prisma.dmLog.updateMany({
-    where: {
-      automationId: automation.id,
-      commentId,
-      status: "PENDING",
-    },
-    data: { status: "SENDING" },
-  });
-
-  if (claim.count === 0) {
-    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-    await releaseDMSlot(instagramAccountId);
-    if (deliveryJobId) {
-      await transitionToPermanentFailure(
-        deliveryJobId,
-        job.attemptsMade + 1,
-        "DmLog claim race lost",
-        "CLAIM_RACE",
-        attemptStartedAt
-      ).catch(() => {});
-    }
-    return;
-  }
-
-  // 11. Render message (or reuse persisted variation payload if set)
-  const dmMessage =
-    persistedMessagePayload ||
-    renderMessageWithTracking({
-      message: automation.dmMessage,
-      commenterName,
-      trackedLinks: automation.trackedLinks,
-    });
-
-  try {
-    const metaResponse = await sendPrivateReply(
-      accessToken,
-      automation.instagramAccount.instagramId,
-      commentId,
-      dmMessage
+  const releaseUsage = () =>
+    releaseSafely("monthly_usage", ids, () =>
+      releaseWorkspaceDMReservation(job.workspaceId, usage.periodStart)
     );
 
-    const metaMsgId = (metaResponse as any)?.message_id || "sent";
+  if (!usage.allowed) {
+    await releaseSlot();
+    await closePending(job.id, "SKIPPED_PLAN_LIMIT", `Monthly DM limit reached (${usage.limit})`, "PLAN_LIMIT");
+    return "PLAN_LIMIT";
+  }
 
-    await prisma.dmLog.update({
-      where: logWhere(automation.id, commentId),
-      data: { status: "SENT", dmSentAt: new Date(), errorMessage: null },
-    });
-
-    if (deliveryJobId) {
-      await transitionToSent(deliveryJobId, metaMsgId, job.attemptsMade + 1, attemptStartedAt).catch(() => {});
-    }
-
-    if (contactId) {
-      await recordContactEvent({
-        workspaceId: automation.workspaceId,
-        contactId,
-        instagramAccountId: automation.instagramAccountId,
-        type: "DM_SENT",
-        referenceId: commentId,
-      }).catch(() => {});
-    }
-
-    // Optional public reply
-    if (automation.publicReplyMessage) {
-      try {
-        await replyToComment(accessToken, commentId, automation.publicReplyMessage);
-        if (contactId) {
-          await recordContactEvent({
-            workspaceId: automation.workspaceId,
-            contactId,
-            instagramAccountId: automation.instagramAccountId,
-            type: "PUBLIC_REPLY",
-            referenceId: commentId,
-          }).catch(() => {});
-        }
-      } catch (replyErr) {
-        console.warn("[dm-worker][public-reply-failed]", replyErr);
-      }
-    }
+  // Fail closed: no durable SENDING state => no send.
+  let claimed: Awaited<ReturnType<typeof claimForSending>>;
+  try {
+    claimed = await claimForSending(job.id);
   } catch (error) {
-    if (isAmbiguousError(error)) {
-      // Do not release monthly usage reservation: external send may have succeeded at Meta
-      await prisma.dmLog.update({
-        where: logWhere(automation.id, commentId),
-        data: {
-          status: "UNKNOWN",
-          errorMessage: `Ambiguous network error: ${formatError(error)}`,
-        },
-      });
-
-      if (deliveryJobId) {
-        await transitionToUnknown(
-          deliveryJobId,
-          job.attemptsMade + 1,
-          `Ambiguous network error: ${formatError(error)}`,
-          undefined,
-          attemptStartedAt
-        ).catch(() => {});
-      }
-      return;
-    }
-
-    await releaseWorkspaceDMReservation(automation.workspaceId, usage.periodStart);
-
-    const metaError = error as MetaApiError;
-    if (isPermanentMetaError(metaError)) {
-      await releaseDMSlot(instagramAccountId);
-
-      if (metaError.code === 190) {
-        await prisma.instagramAccount.updateMany({
-          where: { instagramId: automation.instagramAccount.instagramId },
-          data: { tokenExpiresAt: new Date(0) },
-        });
-
-        await prisma.operationalEvent
-          .create({
-            data: {
-              workspaceId: automation.workspaceId,
-              source: "WORKER",
-              level: "ERROR",
-              message: `Instagram token expired or revoked for @${automation.instagramAccount.username}: ${metaError.message}`,
-              payload: {
-                instagramAccountId: automation.instagramAccountId,
-                errorCode: metaError.code,
-              },
-            },
-          })
-          .catch(() => {});
-      }
-
-      await prisma.dmLog.update({
-        where: logWhere(automation.id, commentId),
-        data: { status: "FAILED", errorMessage: formatError(error) },
-      });
-
-      if (deliveryJobId) {
-        await transitionToPermanentFailure(
-          deliveryJobId,
-          job.attemptsMade + 1,
-          formatError(error),
-          String(metaError.code),
-          attemptStartedAt
-        ).catch(() => {});
-      }
-      return;
-    }
-
-    // Transient Meta error -> retry via BullMQ
-    await releaseDMSlot(instagramAccountId);
-
-    await prisma.dmLog.update({
-      where: logWhere(automation.id, commentId),
-      data: {
-        status: "FAILED",
-        attempts: job.attemptsMade + 1,
-        errorMessage: formatError(error),
-      },
-    });
-
-    if (deliveryJobId) {
-      await transitionToRetryable(
-        deliveryJobId,
-        job.attemptsMade + 1,
-        formatError(error),
-        String(metaError.code),
-        attemptStartedAt
-      ).catch(() => {});
-    }
-
+    await releaseUsage();
+    await releaseSlot();
     throw error;
   }
+  if (!claimed) {
+    await releaseUsage();
+    await releaseSlot();
+    return "CLAIM_LOST";
+  }
+
+  const attempt = { attemptNumber: claimed.attemptCount, startedAt: new Date() };
+
+  let metaMessageId: string | null;
+  try {
+    const response = await sendPrivateReply(
+      accessToken,
+      account.instagramId,
+      job.triggerId,
+      job.messagePayload
+    );
+    metaMessageId = response?.message_id ?? null;
+  } catch (error) {
+    return handleSendFailure(error, {
+      job: { ...job, attemptCount: claimed.attemptCount },
+      attempt,
+      ids,
+      releaseUsage,
+      releaseSlot,
+      accountInstagramId: account.instagramId,
+      accountUsername: account.username,
+    });
+  }
+
+  // The DM was accepted by Meta. Persist SENT; if that keeps failing the job
+  // stays SENDING and is later marked UNKNOWN: it is never re-sent.
+  try {
+    await withPersistRetries(() => markSent(job.id, metaMessageId, attempt));
+  } catch (error) {
+    logEvent("error", "delivery.sent_but_not_persisted", { ...ids, error: describeError(error) });
+    await bestEffort("worker_alert", ids, () =>
+      recordWorkerAlert({
+        level: "error",
+        message: `DM ${job.id} was accepted by Meta but SENT could not be persisted; it will be marked UNKNOWN and not re-sent`,
+        commentId: job.triggerId,
+      })
+    );
+    throw error;
+  }
+
+  if (job.contactId) {
+    await bestEffort("contact_event", ids, () =>
+      recordContactEvent({
+        workspaceId: job.workspaceId,
+        contactId: job.contactId!,
+        instagramAccountId: job.instagramAccountId,
+        type: "DM_SENT",
+        referenceId: job.triggerId,
+        metadata: { deliveryJobId: job.id },
+      })
+    );
+  }
+
+  if (job.automation.publicReplyMessage) {
+    try {
+      await replyToComment(accessToken, job.triggerId, job.automation.publicReplyMessage);
+      if (job.contactId) {
+        await bestEffort("contact_event", ids, () =>
+          recordContactEvent({
+            workspaceId: job.workspaceId,
+            contactId: job.contactId!,
+            instagramAccountId: job.instagramAccountId,
+            type: "PUBLIC_REPLY",
+            referenceId: job.triggerId,
+          })
+        );
+      }
+    } catch (error) {
+      logEvent("warn", "delivery.public_reply_failed", { ...ids, error: formatError(error) });
+    }
+  }
+
+  return "SENT";
 }
 
-// ---------------------------------------------------------------------------
+interface SendFailureContext {
+  job: {
+    id: string;
+    workspaceId: string;
+    instagramAccountId: string;
+    attemptCount: number;
+    rateLimitDeferrals: number;
+    deadlineAt: Date | null;
+  };
+  attempt: { attemptNumber: number; startedAt: Date };
+  ids: Record<string, unknown>;
+  releaseUsage: () => Promise<void>;
+  releaseSlot: () => Promise<void>;
+  accountInstagramId: string;
+  accountUsername: string;
+}
 
-async function recordWorkerFailure(
-  job: Job<ProcessCommentJob> | undefined,
-  error: Error
-) {
+async function handleSendFailure(error: unknown, ctx: SendFailureContext): Promise<DeliveryOutcome> {
+  const { job, attempt, ids } = ctx;
+  const message = formatError(error);
+
+  // Ambiguous: Meta may have accepted the message. Keep usage, never retry.
+  const ambiguous =
+    (error instanceof MetaNetworkError && error.ambiguous) ||
+    !(error instanceof MetaApiError || error instanceof MetaNetworkError);
+  if (ambiguous) {
+    logEvent("warn", "delivery.ambiguous_outcome", { ...ids, error: message });
+    await withPersistRetries(() =>
+      markUnknown(job.id, {
+        ...attempt,
+        errorMessage: `Ambiguous outcome: ${message}`,
+        errorCode: error instanceof MetaNetworkError ? error.causeCode ?? "NETWORK" : "UNCLASSIFIED",
+      })
+    );
+    return "UNKNOWN";
+  }
+
+  // Definite rejection from here on: the DM was not sent.
+  await ctx.releaseUsage();
+
+  if (error instanceof RateLimitError) {
+    const delay =
+      error.retryAfterMs !== undefined
+        ? error.retryAfterMs + jitterMs(30_000)
+        : computeBackoffMs(job.rateLimitDeferrals);
+    const scheduledAt = new Date(Date.now() + delay);
+    await withPersistRetries(() =>
+      rescheduleAfterAttempt(job.id, scheduledAt, {
+        ...attempt,
+        rateLimited: true,
+        errorMessage: message,
+        errorCode: String(error.code),
+      })
+    );
+    logEvent("warn", "delivery.meta_rate_limited", { ...ids, retryAt: scheduledAt, retryAfterMs: error.retryAfterMs });
+    await enqueueOrLog({ id: job.id, scheduledAt, deadlineAt: job.deadlineAt });
+    return "RESCHEDULED";
+  }
+
+  await ctx.releaseSlot();
+
+  if (error instanceof MetaApiError && PERMANENT_META_ERROR_CODES.has(error.code)) {
+    await withPersistRetries(() =>
+      markFailedAfterSend(job.id, { ...attempt, errorMessage: message, errorCode: String(error.code) })
+    );
+    if (error.code === 190) await handleRevokedToken(ctx, error);
+    return "FAILED";
+  }
+
+  // Transient Meta error, or the connection never reached Meta.
+  const errorCode = error instanceof MetaApiError ? String(error.code) : (error as MetaNetworkError).causeCode ?? "NETWORK";
+  // Only transient failures count toward the cap; Meta rate-limit rejections
+  // are bounded by the eligibility deadline instead.
+  const transientAttempts =
+    (await prisma.deliveryAttempt.count({
+      where: { deliveryJobId: job.id, errorType: "RETRYABLE" },
+    })) + 1;
+  if (transientAttempts >= DELIVERY_CONFIG.maxTransientAttempts) {
+    await withPersistRetries(() =>
+      markFailedAfterSend(job.id, {
+        ...attempt,
+        errorMessage: `${message} (gave up after ${transientAttempts} transient failures)`,
+        errorCode,
+      })
+    );
+    return "FAILED";
+  }
+
+  const scheduledAt = new Date(Date.now() + computeBackoffMs(transientAttempts));
+  await withPersistRetries(() =>
+    rescheduleAfterAttempt(job.id, scheduledAt, {
+      ...attempt,
+      rateLimited: false,
+      errorMessage: message,
+      errorCode,
+    })
+  );
+  await enqueueOrLog({ id: job.id, scheduledAt, deadlineAt: job.deadlineAt });
+  return "RESCHEDULED";
+}
+
+async function handleRevokedToken(ctx: SendFailureContext, error: MetaApiError) {
+  await bestEffort("token_expiry_mark", ctx.ids, () =>
+    prisma.instagramAccount.updateMany({
+      where: { instagramId: ctx.accountInstagramId },
+      data: { tokenExpiresAt: new Date(0) },
+    })
+  );
+  await bestEffort("operational_event", ctx.ids, () =>
+    prisma.operationalEvent.create({
+      data: {
+        workspaceId: ctx.job.workspaceId,
+        source: "WORKER",
+        level: "ERROR",
+        message: `Instagram token expired or revoked for @${ctx.accountUsername}: ${error.message}`,
+        payload: {
+          instagramAccountId: ctx.job.instagramAccountId,
+          errorCode: error.code,
+        },
+      },
+    })
+  );
+}
+
+// ─── Worker wiring ───────────────────────────────────────────────────────────
+
+export async function processQueueJob(job: Job<DMQueueJobData>): Promise<void> {
+  if (isDeliverJob(job.data)) {
+    await deliverDeliveryJob(job.data.deliveryJobId);
+    return;
+  }
+  await processCommentJob(job.data);
+}
+
+async function recordWorkerFailure(job: Job<DMQueueJobData> | undefined, error: Error) {
+  const data = job?.data;
+  const instagramAccountId = data && !isDeliverJob(data) ? data.instagramAccountId : null;
+  const commentId = data && !isDeliverJob(data) ? data.commentId : null;
+  const deliveryJobId = data && isDeliverJob(data) ? data.deliveryJobId : null;
+
+  logEvent("error", "worker.job_failed", {
+    jobId: job?.id ?? null,
+    attemptsMade: job?.attemptsMade ?? null,
+    instagramAccountId,
+    commentId,
+    deliveryJobId,
+    error: describeError(error),
+  });
+
   try {
-    const instagramAccountId = job?.data.instagramAccountId;
     const account = instagramAccountId
       ? await prisma.instagramAccount.findUnique({
           where: { instagramId: instagramAccountId },
@@ -599,8 +710,9 @@ async function recordWorkerFailure(
         payload: {
           jobId: job?.id ?? null,
           attemptsMade: job?.attemptsMade ?? null,
-          instagramAccountId: instagramAccountId ?? null,
-          commentId: job?.data.commentId ?? null,
+          instagramAccountId,
+          commentId,
+          deliveryJobId,
         },
       },
     });
@@ -609,21 +721,23 @@ async function recordWorkerFailure(
       level: "error",
       message: error.message,
       jobId: job?.id,
+      instagramAccountId: instagramAccountId ?? undefined,
+      commentId: commentId ?? undefined,
     });
   } catch (logError) {
-    console.error("[dm-worker] Failed to record failure event:", logError);
+    logEvent("error", "worker.failure_record_failed", { error: describeError(logError) });
   }
 }
 
-let workerInstance: Worker<ProcessCommentJob> | null = null;
+let workerInstance: Worker<DMQueueJobData> | null = null;
 
-export function getDMWorker(): Worker<ProcessCommentJob> {
+export function getDMWorker(): Worker<DMQueueJobData> {
   if (workerInstance) return workerInstance;
 
-  workerInstance = new Worker<ProcessCommentJob>(
+  workerInstance = new Worker<DMQueueJobData>(
     "dm-queue",
-    async (job: Job<ProcessCommentJob>) => {
-      await processComment(job);
+    async (job: Job<DMQueueJobData>) => {
+      await processQueueJob(job);
     },
     {
       connection: getRedisConnection(),
@@ -632,10 +746,7 @@ export function getDMWorker(): Worker<ProcessCommentJob> {
       settings: {
         backoffStrategies: {
           exponentialish: (attemptsMade: number) => {
-            const index = Math.min(
-              attemptsMade - 1,
-              BACKOFF_DELAYS.length - 1
-            );
+            const index = Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1);
             return BACKOFF_DELAYS[Math.max(0, index)];
           },
         },
@@ -648,13 +759,13 @@ export function getDMWorker(): Worker<ProcessCommentJob> {
   });
 
   workerInstance.on("error", (error) => {
-    console.error("[dm-worker] Worker error:", error);
+    logEvent("error", "worker.error", { error: describeError(error) });
   });
 
   return workerInstance;
 }
 
-export function createDMWorker(): Worker<ProcessCommentJob> {
+export function createDMWorker(): Worker<DMQueueJobData> {
   workerInstance = null;
   return getDMWorker();
 }

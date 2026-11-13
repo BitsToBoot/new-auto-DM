@@ -7,10 +7,11 @@
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockGet, mockEval, mockDel } = vi.hoisted(() => ({
+const { mockGet, mockEval, mockDel, mockPttl } = vi.hoisted(() => ({
   mockGet: vi.fn(),
   mockEval: vi.fn(),
   mockDel: vi.fn(),
+  mockPttl: vi.fn(),
 }));
 
 // The rate limiter lazily calls getRedisConnection() — mock that module.
@@ -19,6 +20,7 @@ vi.mock("@/lib/queue/client", () => ({
     get: mockGet,
     eval: mockEval,
     del: mockDel,
+    pttl: mockPttl,
   }),
   getDMQueue: vi.fn(),
 }));
@@ -71,14 +73,16 @@ describe("checkRateLimit", () => {
     expect(result.shouldSkip).toBe(false);
   });
 
-  it("should skip after max requeue attempts", async () => {
+  it("never skips, however many times a delivery was deferred (Bug 11)", async () => {
     mockGet.mockResolvedValue(String(RATE_LIMIT_MAX));
+    mockPttl.mockResolvedValue(42_000);
 
-    const result = await checkRateLimit("account_123", 3);
+    const result = await checkRateLimit("account_123", 50);
 
     expect(result.allowed).toBe(false);
-    expect(result.shouldRequeue).toBe(false);
-    expect(result.shouldSkip).toBe(true);
+    expect(result.shouldRequeue).toBe(true);
+    expect(result.shouldSkip).toBe(false);
+    expect(result.requeueDelayMs).toBe(42_000);
   });
 });
 
@@ -112,14 +116,24 @@ describe("reserveDMSlot", () => {
     expect(result.shouldSkip).toBe(false);
   });
 
-  it("should skip after max requeue attempts", async () => {
-    mockEval.mockResolvedValue(["0", String(RATE_LIMIT_MAX), "0"]);
+  it("never skips and reports when the current window resets (Bug 11)", async () => {
+    mockEval.mockResolvedValue(["0", String(RATE_LIMIT_MAX), "0", "1234567"]);
 
-    const result = await reserveDMSlot("account_123", 3);
+    const result = await reserveDMSlot("account_123", 99);
 
     expect(result.allowed).toBe(false);
-    expect(result.shouldRequeue).toBe(false);
-    expect(result.shouldSkip).toBe(true);
+    expect(result.shouldRequeue).toBe(true);
+    expect(result.shouldSkip).toBe(false);
+    expect(result.requeueDelayMs).toBe(1_234_567);
+  });
+
+  it("falls back to the configured delay when the window TTL is unknown", async () => {
+    mockEval.mockResolvedValue([0, RATE_LIMIT_MAX, 0, -1]);
+
+    const result = await reserveDMSlot("account_123");
+
+    expect(result.requeueDelayMs).toBeGreaterThan(0);
+    expect(result.shouldSkip).toBe(false);
   });
 });
 

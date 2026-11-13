@@ -1,3 +1,12 @@
+/**
+ * Client-safe tracked-link helpers (also imported by the campaign builder UI).
+ *
+ * Message rendering lives in lib/delivery/renderer.ts (renderDmMessage), the
+ * single canonical implementation. Delivery-attributed tracked URLs are built
+ * server-side by lib/tracking/attribution.ts (buildDeliveryTrackedUrl), which
+ * delegates to buildTrackedUrl below.
+ */
+
 export interface MessageTrackedLink {
   slug: string;
   destinationUrl: string;
@@ -34,44 +43,32 @@ export function replaceUrlWithTrackedPlaceholder(
   return message.replace(withoutTrailingSlash, "{link}");
 }
 
-export function buildTrackedUrl(slug: string, baseUrl?: string) {
+export interface TrackedUrlAttribution {
+  deliveryJobId: string;
+  signature: string;
+}
+
+/**
+ * The one canonical tracked-URL builder. With `attribution`, appends the
+ * delivery job ID (`d`) and its signature (`s`) consumed by app/r/[slug].
+ */
+export function buildTrackedUrl(
+  slug: string,
+  baseUrl?: string,
+  attribution?: TrackedUrlAttribution
+) {
   const resolvedBaseUrl =
     baseUrl ??
     (typeof window !== "undefined"
       ? window.location.origin
       : process.env.NEXTAUTH_URL ?? "http://localhost:3000");
 
-  return `${resolvedBaseUrl.replace(/\/$/, "")}/r/${slug}`;
-}
+  const url = `${resolvedBaseUrl.replace(/\/$/, "")}/r/${slug}`;
+  if (!attribution) return url;
 
-export function renderMessageWithTracking({
-  message,
-  commenterName,
-  trackedLinks,
-  baseUrl,
-}: {
-  message: string;
-  commenterName?: string | null;
-  trackedLinks?: MessageTrackedLink[];
-  baseUrl?: string;
-}) {
-  let rendered = message.replace(/\{username\}/gi, commenterName ?? "there");
-  const primaryLink = trackedLinks?.[0];
-
-  if (!primaryLink) return rendered;
-
-  const trackedUrl = buildTrackedUrl(primaryLink.slug, baseUrl);
-
-  if (/\{link\}/i.test(rendered)) {
-    return rendered.replace(/\{link\}/gi, trackedUrl);
-  }
-
-  if (rendered.includes(primaryLink.destinationUrl)) {
-    rendered = rendered.replaceAll(primaryLink.destinationUrl, trackedUrl);
-  } else {
-    const withoutTrailingSlash = primaryLink.destinationUrl.replace(/\/$/, "");
-    rendered = rendered.replaceAll(withoutTrailingSlash, trackedUrl);
-  }
-
-  return rendered;
+  const params = new URLSearchParams({
+    d: attribution.deliveryJobId,
+    s: attribution.signature,
+  });
+  return `${url}?${params.toString()}`;
 }

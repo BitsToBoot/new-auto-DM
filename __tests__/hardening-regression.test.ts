@@ -232,8 +232,8 @@ describe("BullMQ — queue name and backoff consistency", () => {
 
 // ─── 3. Automation scope selection ─────────────────────────────────────────
 
-describe("Automation — scope selection", () => {
-  it("worker query must fetch all scopes in a single query (no two-phase fallback)", async () => {
+describe("Automation — one canonical resolver in the worker", () => {
+  it("worker delegates campaign selection to lib/automation/resolver", async () => {
     const fs = await import("fs");
     const path = await import("path");
 
@@ -242,27 +242,33 @@ describe("Automation — scope selection", () => {
       "utf-8"
     );
 
-    // Should contain ANY_POST in the query (single-pass)
-    expect(workerSrc).toContain('"ANY_POST"');
-    expect(workerSrc).toContain('"NEXT_POST"');
-
-    // Should NOT contain the old two-phase "Fallback lookup" pattern
-    expect(workerSrc).not.toContain("Fallback lookup");
-    expect(workerSrc).not.toContain("broadAutomations");
+    expect(workerSrc).toContain("resolveAutomationForComment");
+    // No second matching implementation inside the worker.
+    expect(workerSrc).not.toContain("prisma.automation.findMany");
+    expect(workerSrc).not.toContain("matchKeywords(");
+    expect(workerSrc).not.toContain("claimNextPostAutomation");
   });
 
-  it("NEXT_POST claim failure (.catch) must return false, not true", async () => {
+  it("delivery code never swallows errors with empty catch handlers", async () => {
     const fs = await import("fs");
     const path = await import("path");
 
-    const workerSrc = fs.readFileSync(
-      path.resolve(__dirname, "../lib/queue/dm-worker.ts"),
-      "utf-8"
-    );
-
-    // Ensure the catch handler returns false (fail safe) not true
-    expect(workerSrc).toContain(".catch(() => false)");
-    expect(workerSrc).not.toContain(".catch(() => true)");
+    const files = [
+      "../lib/queue/dm-worker.ts",
+      "../lib/delivery/intake.ts",
+      "../lib/delivery/state.ts",
+      "../lib/delivery/scheduler.ts",
+      "../lib/automation/resolver.ts",
+      "../lib/instagram-lifecycle.ts",
+      "../app/api/webhook/route.ts",
+      "../app/r/[slug]/route.ts",
+    ];
+    for (const file of files) {
+      const src = fs.readFileSync(path.resolve(__dirname, file), "utf-8");
+      // Empty or comment-only catch blocks hide failures.
+      expect(src, file).not.toMatch(/catch\s*(\([^)]*\))?\s*\{\s*(\/\/[^\n]*\s*)*\}/);
+      expect(src, file).not.toMatch(/\.catch\(\(\)\s*=>\s*(\{\s*\}|null|false|true|undefined)\)/);
+    }
   });
 });
 
@@ -394,53 +400,42 @@ describe("Webhook — body size limit", () => {
 // ─── 8. DeliveryJob — state transitions on early failures ──────────────────
 
 describe("DeliveryJob — no stuck SENDING on early failure", () => {
-  it("must transition DeliveryJob on token failure", async () => {
+  // Every pre-send rejection closes the job while it is still PENDING; the
+  // PENDING -> SENDING claim happens only after all checks pass.
+  // Behavior is covered end to end in delivery-engine.test.ts.
+  async function workerSource() {
     const fs = await import("fs");
     const path = await import("path");
+    return fs.readFileSync(path.resolve(__dirname, "../lib/queue/dm-worker.ts"), "utf-8");
+  }
 
-    const workerSrc = fs.readFileSync(
-      path.resolve(__dirname, "../lib/queue/dm-worker.ts"),
-      "utf-8"
-    );
+  function sectionAround(src: string, marker: string) {
+    const index = src.indexOf(marker);
+    expect(index, marker).toBeGreaterThan(-1);
+    return src.slice(Math.max(0, index - 200), index + 200);
+  }
 
-    // After "No Instagram access token available", deliveryJobId should be transitioned
-    const tokenGuardSection = workerSrc.slice(
-      workerSrc.indexOf("No Instagram access token available"),
-      workerSrc.indexOf("No Instagram access token available") + 500
-    );
-    expect(tokenGuardSection).toContain("transitionToPermanentFailure");
+  it("must close the DeliveryJob on token failure", async () => {
+    const src = await workerSource();
+    expect(sectionAround(src, "No Instagram access token available")).toContain("closePending");
   });
 
-  it("must transition DeliveryJob on decrypt failure", async () => {
-    const fs = await import("fs");
-    const path = await import("path");
-
-    const workerSrc = fs.readFileSync(
-      path.resolve(__dirname, "../lib/queue/dm-worker.ts"),
-      "utf-8"
-    );
-
-    const decryptSection = workerSrc.slice(
-      workerSrc.indexOf("Failed to decrypt"),
-      workerSrc.indexOf("Failed to decrypt") + 500
-    );
-    expect(decryptSection).toContain("transitionToPermanentFailure");
+  it("must close the DeliveryJob on decrypt failure", async () => {
+    const src = await workerSource();
+    expect(sectionAround(src, "Failed to decrypt Instagram access token")).toContain("closePending");
   });
 
-  it("must transition DeliveryJob on plan limit", async () => {
-    const fs = await import("fs");
-    const path = await import("path");
+  it("must close the DeliveryJob on plan limit", async () => {
+    const src = await workerSource();
+    expect(sectionAround(src, "Monthly DM limit reached")).toContain("closePending");
+  });
 
-    const workerSrc = fs.readFileSync(
-      path.resolve(__dirname, "../lib/queue/dm-worker.ts"),
-      "utf-8"
-    );
-
-    const planLimitSection = workerSrc.slice(
-      workerSrc.indexOf("Monthly DM limit reached"),
-      workerSrc.indexOf("Monthly DM limit reached") + 500
-    );
-    expect(planLimitSection).toContain("transitionToPermanentFailure");
+  it("claims SENDING only after every pre-send check", async () => {
+    const src = await workerSource();
+    const claimIndex = src.indexOf("await claimForSending(");
+    for (const marker of ["NO_TOKEN", "DECRYPT_FAILED", "PLAN_LIMIT", "ACCOUNT_DISCONNECTED", "DEADLINE_PASSED"]) {
+      expect(src.indexOf(`"${marker}"`), marker).toBeLessThan(claimIndex);
+    }
   });
 });
 

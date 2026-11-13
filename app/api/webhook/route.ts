@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { getDMQueue, PROCESS_COMMENT_JOB } from "@/lib/queue/client";
+import { logEvent, describeError } from "@/lib/ops/logger";
 import { parseCommentEvents, verifyWebhookSignature } from "@/lib/meta/webhook";
 import { Prisma } from "@/app/generated/prisma/client";
 
@@ -24,22 +25,26 @@ export async function GET(request: NextRequest) {
 }
 
 /**
- * POST — Receive and enqueue Meta comment events.
+ * POST — Receive Meta comment events.
  *
  * Design contract:
  *  1. Verify HMAC signature.
  *  2. Parse payload into typed comment events.
- *  3. Bulk-enqueue all events into BullMQ in a single call.
- *     BullMQ deduplicates by jobId so duplicate webhooks are safe.
- *  4. Persist a WebhookEvent audit row (QUEUED) asynchronously — the
- *     HTTP 200 is returned before this write completes so Meta never
- *     times out waiting for us.
+ *  3. Durably persist one InboundComment row per comment (single createMany,
+ *     skipDuplicates). This is the comment-level idempotency record and the
+ *     source of truth for pending intake: Redis is never the only place a
+ *     comment exists.
+ *  4. Bulk-enqueue the comments into BullMQ with deterministic job IDs. If
+ *     Redis is unavailable the request still succeeds: the scheduler
+ *     re-enqueues RECEIVED comments.
+ *  5. Persist a WebhookEvent audit row.
+ *
+ * If step 3 fails we return 500 so Meta redelivers the webhook.
  *
  * What this handler intentionally does NOT do:
  *  - automation matching        (worker responsibility)
  *  - token lookup               (worker responsibility)
  *  - Meta API calls             (worker responsibility)
- *  - per-event DB queries       (creates sequential blocking under burst)
  */
 export async function POST(request: NextRequest) {
   // Enforce a 1 MB body size limit to prevent memory exhaustion
@@ -85,45 +90,68 @@ export async function POST(request: NextRequest) {
     payload as Parameters<typeof parseCommentEvents>[0]
   );
 
-  // Bulk-enqueue. BullMQ ignores jobs whose jobId already exists in the queue,
-  // so duplicate Meta webhooks cannot produce duplicate queue entries.
+  let enqueued = false;
   if (commentEvents.length > 0) {
-    const queue = getDMQueue();
-    await queue.addBulk(
-      commentEvents.map((event) => ({
-        name: "process-comment",
-        data: {
+    try {
+      await prisma.inboundComment.createMany({
+        data: commentEvents.map((event) => ({
           instagramAccountId: event.instagramAccountId,
           commentId: event.commentId,
-          commentText: event.commentText,
-          commenterId: event.commenterId,
-          commenterName: event.commenterName,
           mediaId: event.mediaId,
-        },
-        opts: {
-          // Stable jobId: BullMQ treats duplicate IDs as no-ops (idempotent enqueue).
-          jobId: `comment-${event.instagramAccountId}-${event.commentId}`,
-        },
-      }))
-    );
+          commenterId: event.commenterId,
+          commenterUsername: event.commenterName ?? null,
+          commentText: event.commentText,
+          commentedAt: new Date(event.commentedAt),
+        })),
+        skipDuplicates: true,
+      });
+    } catch (error) {
+      logEvent("error", "webhook.persist_failed", { error: describeError(error) });
+      return NextResponse.json(
+        { success: false, error: "Temporarily unable to accept events" },
+        { status: 500 }
+      );
+    }
+
+    try {
+      await getDMQueue().addBulk(
+        commentEvents.map((event) => ({
+          name: PROCESS_COMMENT_JOB,
+          data: {
+            instagramAccountId: event.instagramAccountId,
+            commentId: event.commentId,
+            commentText: event.commentText,
+            commenterId: event.commenterId,
+            commenterName: event.commenterName,
+            mediaId: event.mediaId,
+            commentedAt: event.commentedAt,
+          },
+          opts: {
+            // Stable jobId: BullMQ treats duplicate IDs as no-ops (idempotent enqueue).
+            jobId: `comment-${event.instagramAccountId}-${event.commentId}`,
+          },
+        }))
+      );
+      enqueued = true;
+    } catch (error) {
+      // Comments are durably stored; the scheduler re-enqueues RECEIVED rows.
+      logEvent("warn", "webhook.enqueue_failed_scheduler_will_recover", {
+        count: commentEvents.length,
+        error: describeError(error),
+      });
+    }
   }
 
-  // Persist audit row in the background — do not await so Meta gets an
-  // immediate 200 regardless of DB latency.
-  persistWebhookAudit(payload, commentEvents.length).catch((err: unknown) => {
-    console.error(
-      "[Webhook] Failed to persist audit row:",
-      err instanceof Error ? err.message : err
-    );
-  });
+  try {
+    await persistWebhookAudit(payload, commentEvents.length > 0 && enqueued);
+  } catch (error) {
+    logEvent("warn", "webhook.audit_persist_failed", { error: describeError(error) });
+  }
 
   return NextResponse.json({ success: true }, { status: 200 });
 }
 
-async function persistWebhookAudit(
-  payload: unknown,
-  eventCount: number
-): Promise<void> {
+async function persistWebhookAudit(payload: unknown, queued: boolean): Promise<void> {
   const object =
     typeof payload === "object" && payload && "object" in payload
       ? String((payload as Record<string, unknown>).object)
@@ -133,8 +161,9 @@ async function persistWebhookAudit(
     data: {
       object,
       payload: payload as Prisma.InputJsonValue,
-      // QUEUED means we have enqueued the jobs; the worker tracks deeper state.
-      status: eventCount > 0 ? "QUEUED" : "PENDING",
+      // QUEUED: comments persisted and enqueued. PENDING: persisted only (or
+      // no comment events); the scheduler handles recovery.
+      status: queued ? "QUEUED" : "PENDING",
     },
   });
 }

@@ -7,6 +7,7 @@ import {
   normalizeTopKeywords,
   summarizeDmStatuses,
 } from "@/lib/tracking/analytics";
+import { toDeliveryLogView, deliveryLogInclude } from "@/lib/delivery/views";
 
 export async function GET(request: NextRequest) {
   const workspaceId = await getCurrentWorkspaceId();
@@ -58,7 +59,7 @@ export async function GET(request: NextRequest) {
       },
     }),
     prisma.instagramAccount.findFirst({
-      where: { workspaceId },
+      where: { workspaceId, status: "CONNECTED" },
       orderBy: { connectedAt: "desc" },
       select: {
         id: true,
@@ -69,7 +70,7 @@ export async function GET(request: NextRequest) {
       },
     }),
     prisma.instagramAccount.findMany({
-      where: { workspaceId },
+      where: { workspaceId, status: "CONNECTED" },
       orderBy: { connectedAt: "desc" },
       select: {
         id: true,
@@ -84,34 +85,36 @@ export async function GET(request: NextRequest) {
     prisma.automation.count({
       where: { workspaceId, isActive: true, ...accountFilter },
     }),
-    prisma.dmLog.count({
+    // DeliveryJob is the canonical delivery record. Sent volume is bucketed by
+    // the time the DM was sent.
+    prisma.deliveryJob.count({
       where: {
         workspaceId,
         status: "SENT",
-        createdAt: { gte: todayStart },
+        sentAt: { gte: todayStart },
         ...accountFilter,
       },
     }),
-    prisma.dmLog.count({
+    prisma.deliveryJob.count({
       where: {
         workspaceId,
         status: "SENT",
-        createdAt: { gte: weekStart },
+        sentAt: { gte: weekStart },
         ...accountFilter,
       },
     }),
-    prisma.dmLog.count({
+    prisma.deliveryJob.count({
       where: {
         workspaceId,
         status: "SENT",
-        createdAt: { gte: monthStart },
+        sentAt: { gte: monthStart },
         ...accountFilter,
       },
     }),
-    prisma.dmLog.count({
+    prisma.deliveryJob.count({
       where: { workspaceId, status: "SENT", ...accountFilter },
     }),
-    prisma.dmLog.groupBy({
+    prisma.deliveryJob.groupBy({
       by: ["status"],
       where: { workspaceId, createdAt: { gte: monthStart }, ...accountFilter },
       _count: { _all: true },
@@ -120,19 +123,16 @@ export async function GET(request: NextRequest) {
       where: { workspaceId, createdAt: { gte: monthStart }, ...accountFilter },
     }),
     prisma.linkClick.count({ where: { workspaceId, ...accountFilter } }),
-    prisma.dmLog.groupBy({
+    prisma.deliveryJob.groupBy({
       by: ["matchedKeyword"],
       where: { workspaceId, matchedKeyword: { not: null }, ...accountFilter },
       _count: { _all: true },
     }),
-    prisma.dmLog.findMany({
+    prisma.deliveryJob.findMany({
       where: { workspaceId, ...accountFilter },
       orderBy: { createdAt: "desc" },
       take: 10,
-      include: {
-        automation: { select: { name: true } },
-        instagramAccount: { select: { username: true } },
-      },
+      include: deliveryLogInclude,
     }),
   ]);
 
@@ -142,22 +142,22 @@ export async function GET(request: NextRequest) {
   type DailyRow = { day: Date; count: bigint };
   const rawDailyRows = await (selectedAccountId
     ? prisma.$queryRaw<DailyRow[]>`
-        SELECT DATE_TRUNC('day', "createdAt") AS day, COUNT(*)::bigint AS count
-        FROM "DmLog"
+        SELECT DATE_TRUNC('day', COALESCE("sentAt", "createdAt")) AS day, COUNT(*)::bigint AS count
+        FROM "DeliveryJob"
         WHERE "workspaceId" = ${workspaceId}
           AND status = 'SENT'
-          AND "createdAt" >= ${weekStart}
+          AND COALESCE("sentAt", "createdAt") >= ${weekStart}
           AND "instagramAccountId" = ${selectedAccountId}
-        GROUP BY DATE_TRUNC('day', "createdAt")
+        GROUP BY DATE_TRUNC('day', COALESCE("sentAt", "createdAt"))
         ORDER BY day ASC
       `
     : prisma.$queryRaw<DailyRow[]>`
-        SELECT DATE_TRUNC('day', "createdAt") AS day, COUNT(*)::bigint AS count
-        FROM "DmLog"
+        SELECT DATE_TRUNC('day', COALESCE("sentAt", "createdAt")) AS day, COUNT(*)::bigint AS count
+        FROM "DeliveryJob"
         WHERE "workspaceId" = ${workspaceId}
           AND status = 'SENT'
-          AND "createdAt" >= ${weekStart}
-        GROUP BY DATE_TRUNC('day', "createdAt")
+          AND COALESCE("sentAt", "createdAt") >= ${weekStart}
+        GROUP BY DATE_TRUNC('day', COALESCE("sentAt", "createdAt"))
         ORDER BY day ASC
       `);
 
@@ -214,7 +214,7 @@ export async function GET(request: NextRequest) {
       ctrThisMonth: calculateCtr(clicksThisMonth, dmsSentMonth),
       topKeywords,
       dailyDMs,
-      recentLogs,
+      recentLogs: recentLogs.map(toDeliveryLogView),
     },
   });
 }

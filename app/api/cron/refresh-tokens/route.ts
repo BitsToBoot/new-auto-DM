@@ -31,6 +31,7 @@ export async function GET(request: NextRequest) {
 
   const accountsToRefresh = await prisma.instagramAccount.findMany({
     where: {
+      status: "CONNECTED",
       accessToken: { not: "" },
       tokenExpiresAt: {
         not: null,

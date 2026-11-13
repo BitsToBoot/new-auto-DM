@@ -3,6 +3,7 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { getBaseUrl } from "@/lib/env";
 import { canConnectInstagramAccount } from "@/lib/instagram-accounts";
+import { connectInstagramAccount } from "@/lib/instagram-lifecycle";
 import { getLongLivedToken, getUserInfo, subscribeInstagramAccountToWebhooks } from "@/lib/meta/client";
 import {
   encryptToken,
@@ -90,25 +91,14 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    await prisma.instagramAccount.upsert({
-      where: { instagramId: userInfo.id },
-      create: {
-        workspaceId: state.workspaceId,
-        instagramId: userInfo.id,
-        username: userInfo.username,
-        name: userInfo.name,
-        accessToken: encryptedToken,
-        tokenExpiresAt,
-        webhookSubscribed,
-      },
-      update: {
-        workspaceId: state.workspaceId,
-        username: userInfo.username,
-        name: userInfo.name,
-        accessToken: encryptedToken,
-        tokenExpiresAt,
-        webhookSubscribed,
-      },
+    await connectInstagramAccount({
+      workspaceId: state.workspaceId,
+      instagramId: userInfo.id,
+      username: userInfo.username,
+      name: userInfo.name ?? null,
+      encryptedToken,
+      tokenExpiresAt,
+      webhookSubscribed,
     });
 
     return NextResponse.redirect(`${baseUrl}/dashboard?connected=true`);

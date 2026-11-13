@@ -28,7 +28,7 @@ interface Campaign {
   reportShareEnabled: boolean;
   reportUrl: string | null;
   createdAt: string;
-  _count: { dmLogs: number };
+  _count: { deliveryJobs: number };
   trackedLinks: Array<{
     id: string;
     slug: string;

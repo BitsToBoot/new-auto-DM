@@ -12,6 +12,9 @@ const statusConfig: Record<string, { bg: string; text: string; dot: string; labe
   SKIPPED_RATE_LIMIT: { bg: "bg-warning/10", text: "text-warning", dot: "bg-warning", label: "Rate Limited" },
   SKIPPED_PLAN_LIMIT: { bg: "bg-warning/10", text: "text-warning", dot: "bg-warning", label: "Plan Limit" },
   SKIPPED_NO_MATCH: { bg: "bg-zinc-500/10", text: "text-zinc-400", dot: "bg-zinc-400", label: "No Match" },
+  SENDING: { bg: "bg-warning/10", text: "text-warning", dot: "bg-warning", label: "Sending" },
+  UNKNOWN: { bg: "bg-error/10", text: "text-error", dot: "bg-error", label: "Needs review" },
+  EXPIRED: { bg: "bg-zinc-500/10", text: "text-zinc-400", dot: "bg-zinc-400", label: "Expired" },
 };
 
 interface StatusBadgeProps {

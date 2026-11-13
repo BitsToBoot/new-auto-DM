@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/db/client";
 import {
   canManageWorkspace,
   getCurrentWorkspaceContext,
 } from "@/lib/workspace-access";
+import { disconnectInstagramAccount } from "@/lib/instagram-lifecycle";
 
+/**
+ * Disconnects an Instagram account. This is a lifecycle change, never a
+ * delete: campaigns, delivery history, contacts and click analytics are kept.
+ */
 export async function POST(request: NextRequest) {
   const context = await getCurrentWorkspaceContext();
   if (!context) {
@@ -25,12 +29,24 @@ export async function POST(request: NextRequest) {
   const instagramAccountId =
     typeof body.instagramAccountId === "string" ? body.instagramAccountId : null;
 
-  await prisma.instagramAccount.deleteMany({
-    where: {
-      workspaceId: context.workspaceId,
-      ...(instagramAccountId ? { id: instagramAccountId } : {}),
-    },
+  if (!instagramAccountId) {
+    return NextResponse.json(
+      { success: false, error: "instagramAccountId is required" },
+      { status: 400 }
+    );
+  }
+
+  const result = await disconnectInstagramAccount({
+    workspaceId: context.workspaceId,
+    accountId: instagramAccountId,
   });
 
-  return NextResponse.json({ success: true });
+  if (result.status === "NOT_FOUND") {
+    return NextResponse.json(
+      { success: false, error: "Instagram account not found" },
+      { status: 404 }
+    );
+  }
+
+  return NextResponse.json({ success: true, data: result });
 }

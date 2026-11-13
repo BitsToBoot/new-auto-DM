@@ -16,6 +16,41 @@ import {
   validateAndNormalizeKeywords,
   MAX_KEYWORDS_PER_AUTOMATION,
 } from "@/lib/automation/matcher";
+import { validateMessageTemplate } from "@/lib/delivery/renderer";
+import { maxDeliveryTrackedUrlLength } from "@/lib/tracking/attribution";
+
+/** Generated tracked-link slugs are 10 characters (7 random bytes, base64url). */
+const TRACKED_SLUG_PLACEHOLDER = "x".repeat(10);
+
+/**
+ * Validates the default message and every variation as they will be sent:
+ * supported placeholders only, {link} only with a tracked link, and at most
+ * Meta's 1000 UTF-8 byte limit after worst-case placeholder expansion.
+ */
+function validateCampaignMessages(
+  messages: { label: string; text: string }[],
+  trackedLink: { slug: string; destinationUrl: string } | null
+): string | null {
+  const maxTrackedUrlLength = maxDeliveryTrackedUrlLength(
+    trackedLink?.slug ?? TRACKED_SLUG_PLACEHOLDER
+  );
+  for (const { label, text } of messages) {
+    const result = validateMessageTemplate(text, {
+      hasTrackedLink: Boolean(trackedLink),
+      maxTrackedUrlLength,
+      destinationUrl: trackedLink?.destinationUrl ?? null,
+    });
+    if (!result.valid) return `${label}: ${result.error}`;
+  }
+  return null;
+}
+
+function labelMessages(dmMessage: string | undefined, variations: string[] | undefined) {
+  return [
+    ...(dmMessage !== undefined ? [{ label: "DM message", text: dmMessage }] : []),
+    ...(variations ?? []).map((text, index) => ({ label: `Variation ${index + 1}`, text })),
+  ];
+}
 
 const createAutomationSchema = z.object({
   name: z.string().min(1).max(100),
@@ -81,7 +116,7 @@ export async function GET(request: NextRequest) {
         select: { id: true, message: true, isActive: true },
       },
       _count: {
-        select: { dmLogs: true, deliveryJobs: true },
+        select: { deliveryJobs: true },
       },
       trackedLinks: {
         select: {
@@ -101,7 +136,7 @@ export async function GET(request: NextRequest) {
   // GET is strictly read-only.
   // Aggregations use SQL GROUP BY.
   const [statusCounts, clickCounts, keywordCounts] = await Promise.all([
-    prisma.dmLog.groupBy({
+    prisma.deliveryJob.groupBy({
       by: ["automationId", "status"],
       where: { workspaceId },
       _count: { _all: true },
@@ -111,7 +146,7 @@ export async function GET(request: NextRequest) {
       where: { workspaceId },
       _count: { _all: true },
     }),
-    prisma.dmLog.groupBy({
+    prisma.deliveryJob.groupBy({
       by: ["automationId", "matchedKeyword"],
       where: { workspaceId, matchedKeyword: { not: null } },
       _count: { _all: true },
@@ -144,8 +179,8 @@ export async function GET(request: NextRequest) {
     if (!item) continue;
     const count = row._count._all;
     if (row.status === "SENT") item.sent += count;
-    if (row.status === "FAILED") item.failed += count;
-    if (row.status?.startsWith?.("SKIPPED_")) item.skipped += count;
+    if (row.status === "FAILED" || row.status === "UNKNOWN") item.failed += count;
+    if (row.status?.startsWith?.("SKIPPED_") || row.status === "EXPIRED") item.skipped += count;
   }
 
   for (const row of clickCounts as any[]) {
@@ -269,6 +304,16 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const messageError = validateCampaignMessages(
+    labelMessages(data.dmMessage, data.variations),
+    data.trackedDestinationUrl
+      ? { slug: TRACKED_SLUG_PLACEHOLDER, destinationUrl: data.trackedDestinationUrl }
+      : null
+  );
+  if (messageError) {
+    return NextResponse.json({ success: false, error: messageError }, { status: 400 });
+  }
+
   const requestedInstagramAccountId =
     data.instagramAccountId && data.instagramAccountId !== "all"
       ? data.instagramAccountId
@@ -281,10 +326,10 @@ export async function POST(request: NextRequest) {
     }),
     requestedInstagramAccountId
       ? prisma.instagramAccount.findFirst({
-          where: { id: requestedInstagramAccountId, workspaceId },
+          where: { id: requestedInstagramAccountId, workspaceId, status: "CONNECTED" },
         })
       : prisma.instagramAccount.findFirst({
-          where: { workspaceId },
+          where: { workspaceId, status: "CONNECTED" },
           orderBy: { connectedAt: "desc" },
         }),
     prisma.automation.count({ where: { workspaceId } }),
@@ -435,6 +480,14 @@ export async function PATCH(request: NextRequest) {
 
   const existing = await prisma.automation.findFirst({
     where: { id: automationId, workspaceId },
+    include: {
+      trackedLinks: {
+        where: { active: true },
+        select: { slug: true, destinationUrl: true },
+        orderBy: { createdAt: "asc" },
+        take: 1,
+      },
+    },
   });
 
   if (!existing) {
@@ -445,6 +498,16 @@ export async function PATCH(request: NextRequest) {
   }
 
   const data = parsed.data;
+
+  if (data.dmMessage !== undefined || data.variations !== undefined) {
+    const messageError = validateCampaignMessages(
+      labelMessages(data.dmMessage, data.variations),
+      existing.trackedLinks[0] ?? null
+    );
+    if (messageError) {
+      return NextResponse.json({ success: false, error: messageError }, { status: 400 });
+    }
+  }
 
   // Handle keyword updates if specified
   let keywordValidationResult = null;

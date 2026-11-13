@@ -31,6 +31,9 @@ export interface WebhookCommentEvent {
   commenterId: string;
   commenterName?: string;
   mediaId: string;
+  /** ISO timestamp of the comment (webhook entry time), used for the
+   *  private-reply eligibility deadline. */
+  commentedAt: string;
 }
 
 interface WebhookEntry {
@@ -59,7 +62,27 @@ interface WebhookPayload {
   entry: WebhookEntry[];
 }
 
-export function parseCommentEvents(payload: WebhookPayload): WebhookCommentEvent[] {
+function isNonEmptyId(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= 128;
+}
+
+/**
+ * Converts the webhook entry time to an ISO string. Meta sends Unix seconds;
+ * millisecond values are tolerated. Missing, invalid or future-skewed values
+ * fall back to the receive time (never later than now, so the deadline is never
+ * extended beyond Meta's window).
+ */
+export function resolveCommentTime(entryTime: unknown, receivedAt: Date = new Date()): string {
+  const raw = typeof entryTime === "number" ? entryTime : Number(entryTime);
+  if (!Number.isFinite(raw) || raw <= 0) return receivedAt.toISOString();
+  const ms = raw > 1e12 ? raw : raw * 1000;
+  return new Date(Math.min(ms, receivedAt.getTime())).toISOString();
+}
+
+export function parseCommentEvents(
+  payload: WebhookPayload,
+  receivedAt: Date = new Date()
+): WebhookCommentEvent[] {
   const events: WebhookCommentEvent[] = [];
 
   if (payload.object !== "instagram") {
@@ -75,7 +98,12 @@ export function parseCommentEvents(payload: WebhookPayload): WebhookCommentEvent
       const mediaId = value?.media?.id ?? value?.media_id;
       const commenterId = value?.from?.id;
 
-      if (!entry.id || !commentId || !mediaId || !commenterId) {
+      if (
+        !isNonEmptyId(entry.id) ||
+        !isNonEmptyId(commentId) ||
+        !isNonEmptyId(mediaId) ||
+        !isNonEmptyId(commenterId)
+      ) {
         continue;
       }
 
@@ -84,8 +112,10 @@ export function parseCommentEvents(payload: WebhookPayload): WebhookCommentEvent
         commentId,
         commentText: value.text ?? "",
         commenterId,
-        commenterName: value.from?.username,
+        commenterName:
+          typeof value.from?.username === "string" ? value.from.username : undefined,
         mediaId,
+        commentedAt: resolveCommentTime(entry.time, receivedAt),
       });
     }
   }

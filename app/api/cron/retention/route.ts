@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { cleanupExpiredWebhookEvents } from "@/lib/ops/retention";
+import { cleanupExpiredWebhookEvents, cleanupProcessedInboundComments } from "@/lib/ops/retention";
 
 const MIN_RETENTION_DAYS = 1;
 const MAX_RETENTION_DAYS = 365;
@@ -37,7 +37,8 @@ async function handleRetention(request: NextRequest) {
 
   try {
     const result = await cleanupExpiredWebhookEvents({ retentionDays: days });
-    return NextResponse.json({ success: true, ...result });
+    const inboundComments = await cleanupProcessedInboundComments({ retentionDays: days });
+    return NextResponse.json({ success: true, ...result, inboundComments });
   } catch (error: any) {
     return NextResponse.json(
       { success: false, error: error.message },

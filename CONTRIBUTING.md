@@ -13,11 +13,13 @@ This project is public because the core Instagram comment-to-DM engine should be
 - Help with production hardening.
 - Build small UI improvements.
 
-Good starting points:
+Good starting point: the [CampaignCue issue list](https://github.com/BitsToBoot/new-auto-DM/issues).
 
-- [Good first issues](https://github.com/im-anishraj/instagram-comment-to-dm/issues?q=is%3Aissue+is%3Aopen+label%3Atype%3Agood-first-issue)
-- [Documentation issues](https://github.com/im-anishraj/instagram-comment-to-dm/issues?q=is%3Aissue+is%3Aopen+label%3Atype%3Adocs)
-- [Template issues](https://github.com/im-anishraj/instagram-comment-to-dm/issues?q=is%3Aissue+is%3Aopen+label%3Aarea%3Atemplates)
+CampaignCue is maintained by Shubham Sharma and Yashwant Khatri. It is a fork of [instagram-comment-to-dm](https://github.com/im-anishraj/instagram-comment-to-dm) by Anish Raj.
+
+## Licensing Of Contributions
+
+CampaignCue is MIT licensed (see [LICENSE](LICENSE) and [NOTICE](NOTICE)). By opening a pull request, you agree that your contribution is licensed under the MIT License. Keep existing copyright and license notices intact, and do not submit code you are not entitled to license under MIT.
 
 ## Development Setup
 

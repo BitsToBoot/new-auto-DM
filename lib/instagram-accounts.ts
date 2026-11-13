@@ -23,10 +23,17 @@ export async function canConnectInstagramAccount({
 }) {
   const existingAccount = await prisma.instagramAccount.findUnique({
     where: { instagramId },
-    select: { workspaceId: true },
+    select: { workspaceId: true, status: true },
   });
 
-  if (existingAccount && existingAccount.workspaceId !== workspaceId) {
+  // A CONNECTED (or mid-disconnect) account belongs to its workspace. A
+  // DISCONNECTED one may be connected elsewhere: the callback archives the old
+  // row so that workspace keeps its history.
+  if (
+    existingAccount &&
+    existingAccount.workspaceId !== workspaceId &&
+    existingAccount.status !== "DISCONNECTED"
+  ) {
     return {
       allowed: false,
       reason: "already_connected" as const,
@@ -44,7 +51,7 @@ export async function canConnectInstagramAccount({
 
   const limit = getInstagramAccountLimit(plan, subscriptionStatus);
   const currentCount = await prisma.instagramAccount.count({
-    where: { workspaceId },
+    where: { workspaceId, status: "CONNECTED" },
   });
 
   return {
@@ -60,12 +67,12 @@ export async function getWorkspaceInstagramAccount(
 ) {
   if (instagramAccountId && instagramAccountId !== "all") {
     return prisma.instagramAccount.findFirst({
-      where: { id: instagramAccountId, workspaceId },
+      where: { id: instagramAccountId, workspaceId, status: "CONNECTED" },
     });
   }
 
   return prisma.instagramAccount.findFirst({
-    where: { workspaceId },
+    where: { workspaceId, status: "CONNECTED" },
     orderBy: { connectedAt: "desc" },
   });
 }

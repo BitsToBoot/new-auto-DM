@@ -93,12 +93,12 @@ describe("agency workspace helpers", () => {
 
     await getWorkspaceInstagramAccount("workspace_123", "account_1");
     expect(mockPrisma.instagramAccount.findFirst).toHaveBeenCalledWith({
-      where: { id: "account_1", workspaceId: "workspace_123" },
+      where: { id: "account_1", workspaceId: "workspace_123", status: "CONNECTED" },
     });
 
     await getWorkspaceInstagramAccount("workspace_123", "all");
     expect(mockPrisma.instagramAccount.findFirst).toHaveBeenLastCalledWith({
-      where: { workspaceId: "workspace_123" },
+      where: { workspaceId: "workspace_123", status: "CONNECTED" },
       orderBy: { connectedAt: "desc" },
     });
   });

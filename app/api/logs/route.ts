@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
 import { DmStatus } from "@/app/generated/prisma/client";
+import { deliveryLogInclude, toDeliveryLogView } from "@/lib/delivery/views";
 
 export async function GET(request: NextRequest) {
   const workspaceId = await getCurrentWorkspaceId();
@@ -35,23 +36,20 @@ export async function GET(request: NextRequest) {
   };
 
   const [logs, total] = await Promise.all([
-    prisma.dmLog.findMany({
+    prisma.deliveryJob.findMany({
       where,
       orderBy: { createdAt: "desc" },
       skip,
       take: limit,
-      include: {
-        automation: { select: { name: true, keywords: true } },
-        instagramAccount: { select: { username: true } },
-      },
+      include: deliveryLogInclude,
     }),
-    prisma.dmLog.count({ where }),
+    prisma.deliveryJob.count({ where }),
   ]);
 
   return NextResponse.json({
     success: true,
     data: {
-      logs,
+      logs: logs.map(toDeliveryLogView),
       pagination: {
         page,
         limit,

@@ -72,7 +72,7 @@ export async function getCampaignReportBySlug(shareSlug: string) {
 
   const [statusRows, clickCount, keywordRows, latestSentLog] =
     await Promise.all([
-      prisma.dmLog.groupBy({
+      prisma.deliveryJob.groupBy({
         by: ["status"],
         where: {
           workspaceId: automation.workspaceId,
@@ -86,7 +86,7 @@ export async function getCampaignReportBySlug(shareSlug: string) {
           automationId: automation.id,
         },
       }),
-      prisma.dmLog.groupBy({
+      prisma.deliveryJob.groupBy({
         by: ["matchedKeyword"],
         where: {
           workspaceId: automation.workspaceId,
@@ -95,14 +95,14 @@ export async function getCampaignReportBySlug(shareSlug: string) {
         },
         _count: { _all: true },
       }),
-      prisma.dmLog.findFirst({
+      prisma.deliveryJob.findFirst({
         where: {
           workspaceId: automation.workspaceId,
           automationId: automation.id,
           status: "SENT",
         },
-        orderBy: { dmSentAt: "desc" },
-        select: { dmSentAt: true, createdAt: true },
+        orderBy: { sentAt: { sort: "desc", nulls: "last" } },
+        select: { sentAt: true, createdAt: true },
       }),
     ]);
 
@@ -124,13 +124,13 @@ export async function getCampaignReportBySlug(shareSlug: string) {
   type DailyAgg = { day: Date; count: bigint };
   const [rawDmDays, rawClickDays] = await Promise.all([
     prisma.$queryRaw<DailyAgg[]>`
-      SELECT DATE_TRUNC('day', "createdAt") AS day, COUNT(*)::bigint AS count
-      FROM "DmLog"
+      SELECT DATE_TRUNC('day', COALESCE("sentAt", "createdAt")) AS day, COUNT(*)::bigint AS count
+      FROM "DeliveryJob"
       WHERE "workspaceId" = ${automation.workspaceId}
         AND "automationId" = ${automation.id}
         AND status = 'SENT'
-        AND "createdAt" >= ${sevenDaysAgo}
-      GROUP BY DATE_TRUNC('day', "createdAt")
+        AND COALESCE("sentAt", "createdAt") >= ${sevenDaysAgo}
+      GROUP BY DATE_TRUNC('day', COALESCE("sentAt", "createdAt"))
       ORDER BY day ASC
     `,
     prisma.$queryRaw<DailyAgg[]>`
@@ -186,7 +186,7 @@ export async function getCampaignReportBySlug(shareSlug: string) {
       failed: statusSummary.failed,
       clicks: clickCount,
       ctr: calculateCtr(clickCount, statusSummary.sent),
-      latestSentAt: latestSentLog?.dmSentAt ?? latestSentLog?.createdAt ?? null,
+      latestSentAt: latestSentLog?.sentAt ?? latestSentLog?.createdAt ?? null,
     },
     topKeywords,
     daily,

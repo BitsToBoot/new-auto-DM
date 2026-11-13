@@ -4,30 +4,25 @@ import {
   selectMessageVariation,
 } from "@/lib/delivery/renderer";
 
-const { mockPrisma } = vi.hoisted(() => ({
-  mockPrisma: {
-    deliveryJob: {
-      findUnique: vi.fn(),
-      create: vi.fn(),
-      update: vi.fn(),
-      updateMany: vi.fn(),
-    },
-    deliveryAttempt: {
-      create: vi.fn(),
-    },
-  },
-}));
+process.env.NEXTAUTH_SECRET = "test-secret-for-tracked-link-signatures";
 
-vi.mock("@/lib/db/client", () => ({
-  prisma: mockPrisma,
-}));
+vi.mock("@/lib/db/client", async () => {
+  const { createFakePrisma } = await import("./helpers/fake-prisma");
+  return { prisma: createFakePrisma() };
+});
 
-import { claimDeliveryJob } from "@/lib/delivery/claim";
+import { prisma } from "@/lib/db/client";
+import type { FakePrisma } from "./helpers/fake-prisma";
+import { createDeliveryJobForComment } from "@/lib/delivery/intake";
 import {
-  transitionToSent,
-  transitionToUnknown,
-  transitionToRetryable,
+  DeliveryStateConflictError,
+  claimForSending,
+  markSent,
+  markUnknown,
+  rescheduleAfterAttempt,
 } from "@/lib/delivery/state";
+
+const db = prisma as unknown as FakePrisma;
 
 describe("Phase 2 — Message Variations & Rendering", () => {
   it("renders {username}, {name}, and {link} placeholders deterministically", () => {
@@ -47,15 +42,17 @@ describe("Phase 2 — Message Variations & Rendering", () => {
     expect(rendered).toBe("Hey friend! Hope you like this.");
   });
 
-  it("selects only active variations and ignores inactive ones", () => {
+  it("never selects inactive variations", () => {
     const variations = [
       { id: "var_1", message: "Active Variation", isActive: true },
       { id: "var_2", message: "Inactive Variation", isActive: false },
     ];
 
-    const selected = selectMessageVariation(variations, "Fallback default");
-    expect(selected.variationId).toBe("var_1");
-    expect(selected.template).toBe("Active Variation");
+    for (let i = 0; i < 25; i++) {
+      const selected = selectMessageVariation(variations, "Fallback default", `comment_${i}`);
+      expect(selected.variationId).not.toBe("var_2");
+      expect(["Active Variation", "Fallback default"]).toContain(selected.template);
+    }
   });
 
   it("falls back to default automation.dmMessage if no active variations exist", () => {
@@ -63,143 +60,106 @@ describe("Phase 2 — Message Variations & Rendering", () => {
       { id: "var_2", message: "Inactive Variation", isActive: false },
     ];
 
-    const selected = selectMessageVariation(variations, "Fallback default");
+    const selected = selectMessageVariation(variations, "Fallback default", "comment_1");
     expect(selected.variationId).toBeNull();
     expect(selected.template).toBe("Fallback default");
   });
 });
 
 describe("Phase 2 — Delivery Job & Retry Message Stability", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+  const automation = {
+    id: "auto_1",
+    dmMessage: "Fallback DM",
+    variations: [
+      { id: "var_A", message: "Variation A for {username}", isActive: true },
+      { id: "var_B", message: "Variation B for {username}", isActive: true },
+    ],
+  };
+
+  const input = (commentId: string) => ({
+    workspaceId: "ws_1",
+    instagramAccountId: "acc_1",
+    automation,
+    contactId: null,
+    commentId,
+    commenterId: `user_${commentId}`,
+    commenterName: "alex",
+    commentText: "VIP",
+    mediaId: "media_1",
+    matchedKeyword: "VIP",
+    commentedAt: new Date(),
   });
 
-  it("persists selected variation in delivery job upon initial claim", async () => {
-    mockPrisma.deliveryJob.findUnique.mockResolvedValue(null);
-    mockPrisma.deliveryJob.create.mockResolvedValue({
-      id: "job_new_1",
-      automationId: "auto_1",
-      triggerId: "comment_1",
-      messagePayload: "Rendered message variation A",
-      selectedVariationId: "var_A",
-      status: "PENDING",
-      attemptCount: 0,
-    });
-    mockPrisma.deliveryJob.updateMany.mockResolvedValue({ count: 1 });
+  beforeEach(() => db.reset());
 
-    const outcome = await claimDeliveryJob({
-      workspaceId: "ws_1",
-      instagramAccountId: "acc_1",
-      automation: {
-        id: "auto_1",
-        workspaceId: "ws_1",
-        instagramAccountId: "acc_1",
-        triggerType: "COMMENT",
-        triggerScope: "SPECIFIC_POST",
-        keywords: ["VIP"],
-        dmMessage: "Fallback DM",
-        isActive: true,
-        wholeWordMatch: true,
-        createdAt: new Date(),
-        variations: [
-          { id: "var_A", message: "Rendered message variation A", isActive: true },
-        ],
-      },
-      commentId: "comment_1",
-      commenterId: "user_1",
-      commenterName: "alex",
-      commentText: "VIP",
-      matchedKeyword: "VIP",
+  it("persists the selected variation and the fully rendered message on creation", async () => {
+    const outcome = await createDeliveryJobForComment(input("comment_1"));
+
+    expect(outcome.outcome).toBe("CREATED");
+    const job = db.tables.deliveryJob[0];
+    const expected = selectMessageVariation(automation.variations, automation.dmMessage, "comment_1");
+    expect(job.selectedVariationId).toBe(expected.variationId);
+    expect(job.messagePayload).toBe(renderDmMessage(expected.template, { username: "alex" }));
+    expect(job.status).toBe("PENDING");
+    expect(job.deadlineAt).toBeInstanceOf(Date);
+  });
+
+  it("reuses the exact persisted message on retry without re-selecting a variation", async () => {
+    await createDeliveryJobForComment(input("comment_1"));
+    db.tables.deliveryJob[0].messagePayload = "Original Persisted Variation B";
+
+    // Campaign copy changes between attempts; the retry must not pick it up.
+    const replay = await createDeliveryJobForComment({
+      ...input("comment_1"),
+      automation: { ...automation, variations: [{ id: "var_C", message: "New copy", isActive: true }] },
     });
 
-    expect(outcome.success).toBe(true);
-    expect(mockPrisma.deliveryJob.create).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({
-          selectedVariationId: "var_A",
-          messagePayload: "Rendered message variation A",
-          status: "PENDING",
-        }),
-      })
+    expect(replay.outcome).toBe("EXISTING");
+    expect(db.tables.deliveryJob).toHaveLength(1);
+    expect(replay.job.messagePayload).toBe("Original Persisted Variation B");
+  });
+
+  it("records delivery attempts on every state transition", async () => {
+    await createDeliveryJobForComment(input("comment_1"));
+    const id = db.tables.deliveryJob[0].id;
+    const startedAt = new Date();
+
+    const claimed = await claimForSending(id);
+    expect(claimed).toMatchObject({ status: "SENDING", attemptCount: 1 });
+    await rescheduleAfterAttempt(id, new Date(Date.now() + 60_000), {
+      attemptNumber: 1,
+      startedAt,
+      rateLimited: false,
+      errorMessage: "500 Server error",
+      errorCode: "2",
+    });
+    expect(db.tables.deliveryJob[0].status).toBe("PENDING");
+
+    await claimForSending(id);
+    await markUnknown(id, { attemptNumber: 2, startedAt, errorMessage: "Network timeout" });
+    expect(db.tables.deliveryJob[0].status).toBe("UNKNOWN");
+
+    expect(db.tables.deliveryAttempt.map((a) => [a.attemptNumber, a.status, a.errorType])).toEqual([
+      [1, "FAILED", "RETRYABLE"],
+      [2, "UNKNOWN", "AMBIGUOUS"],
+    ]);
+  });
+
+  it("refuses to overwrite a state it does not own", async () => {
+    await createDeliveryJobForComment(input("comment_1"));
+    const id = db.tables.deliveryJob[0].id;
+    // Not SENDING: a late SENT write must not clobber the row or add an attempt.
+    await expect(markSent(id, "mid", { attemptNumber: 1, startedAt: new Date() })).rejects.toBeInstanceOf(
+      DeliveryStateConflictError
     );
+    expect(db.tables.deliveryJob[0].status).toBe("PENDING");
+    expect(db.tables.deliveryAttempt).toHaveLength(0);
   });
 
-  it("reuses the exact same persisted message on retry without re-selecting a variation", async () => {
-    const existingJob = {
-      id: "job_retry_1",
-      automationId: "auto_1",
-      triggerId: "comment_1",
-      messagePayload: "Original Persisted Variation B",
-      selectedVariationId: "var_B",
-      status: "FAILED",
-      attemptCount: 1,
-    };
-
-    mockPrisma.deliveryJob.findUnique.mockResolvedValue(existingJob);
-    mockPrisma.deliveryJob.updateMany.mockResolvedValue({ count: 1 });
-
-    const outcome = await claimDeliveryJob({
-      workspaceId: "ws_1",
-      instagramAccountId: "acc_1",
-      automation: {
-        id: "auto_1",
-        workspaceId: "ws_1",
-        instagramAccountId: "acc_1",
-        triggerType: "COMMENT",
-        triggerScope: "SPECIFIC_POST",
-        keywords: ["VIP"],
-        dmMessage: "Fallback DM",
-        isActive: true,
-        wholeWordMatch: true,
-        createdAt: new Date(),
-        variations: [
-          { id: "var_A", message: "Different variation A", isActive: true },
-          { id: "var_B", message: "Different variation B", isActive: true },
-        ],
-      },
-      commentId: "comment_1",
-      commenterId: "user_1",
-      commenterName: "alex",
-      commentText: "VIP",
-      matchedKeyword: "VIP",
-    });
-
-    expect(outcome.success).toBe(true);
-    // Never calls create on retry
-    expect(mockPrisma.deliveryJob.create).not.toHaveBeenCalled();
-    // Claimed deliveryJob retains the original messagePayload
-    if (outcome.success) {
-      expect(outcome.deliveryJob.messagePayload).toBe("Original Persisted Variation B");
-    }
-  });
-
-  it("records delivery attempts on state transitions", async () => {
-    mockPrisma.deliveryJob.update.mockResolvedValue({});
-    mockPrisma.deliveryAttempt.create.mockResolvedValue({});
-
-    await transitionToSent("job_123", "meta_msg_999", 1, new Date());
-    expect(mockPrisma.deliveryJob.update).toHaveBeenCalledWith({
-      where: { id: "job_123" },
-      data: expect.objectContaining({ status: "SENT", metaMessageId: "meta_msg_999" }),
-    });
-    expect(mockPrisma.deliveryAttempt.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        deliveryJobId: "job_123",
-        status: "SENT",
-        metaMessageId: "meta_msg_999",
-      }),
-    });
-
-    await transitionToUnknown("job_123", 2, "Network timeout", undefined, new Date());
-    expect(mockPrisma.deliveryJob.update).toHaveBeenCalledWith({
-      where: { id: "job_123" },
-      data: expect.objectContaining({ status: "UNKNOWN" }),
-    });
-
-    await transitionToRetryable("job_123", 2, "500 Server error", "500", new Date());
-    expect(mockPrisma.deliveryJob.update).toHaveBeenCalledWith({
-      where: { id: "job_123" },
-      data: expect.objectContaining({ status: "PENDING" }),
-    });
+  it("only one of two concurrent claims wins", async () => {
+    await createDeliveryJobForComment(input("comment_1"));
+    const id = db.tables.deliveryJob[0].id;
+    const results = await Promise.all([claimForSending(id), claimForSending(id)]);
+    expect(results.filter(Boolean)).toHaveLength(1);
   });
 });

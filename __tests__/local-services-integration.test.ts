@@ -11,22 +11,28 @@
  * - Automation matching across scopes (SPECIFIC_POST, NEXT_POST, ANY_POST)
  * - Atomic NEXT_POST claim handling
  * - Concurrent DeliveryJob claim races
- * - DeliveryJob state transitions: NO_TOKEN, DECRYPT_FAILED, PLAN_LIMIT, RATE_LIMIT, UNKNOWN (ambiguous), FAILED, SENT
- * - Monthly usage reservation preservation on ambiguous Meta outcome
+ * - DeliveryJob state transitions: NO_TOKEN, DECRYPT_FAILED, PLAN_LIMIT, rate-limit deferral, UNKNOWN (ambiguous), FAILED, SENT
+ * - Database-enforced "DM each user once per campaign" (unique dedupKey)
  * - Worker graceful shutdown
+ *
+ * Requires `docker-compose up -d` and `npm run db:migrate`.
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
 import { createDMWorker } from "@/lib/queue/dm-worker";
 import { prisma } from "@/lib/db/client";
-import { claimDeliveryJob } from "@/lib/delivery/claim";
+import { createDeliveryJobForComment } from "@/lib/delivery/intake";
 import {
-  transitionToSent,
-  transitionToPermanentFailure,
-  transitionToRetryable,
-  transitionToUnknown,
+  claimForSending,
+  closePending,
+  deferPending,
+  markFailedAfterSend,
+  markSent,
+  markUnknown,
+  rescheduleAfterAttempt,
 } from "@/lib/delivery/state";
+import { deliverJobId } from "@/lib/delivery/scheduler";
 import { claimNextPostAutomation } from "@/lib/automation/resolver";
 import { selectWinningAutomation } from "@/lib/automation/policy";
 
@@ -141,14 +147,12 @@ describe("Local Services Integration — PostgreSQL & Redis/BullMQ", () => {
       await worker.close();
     });
 
-    it("verifies deterministic retry job ID format without colons", () => {
-      const accountId = "acc_456";
-      const commentId = "comm_789";
-      const requeueAttempt = 1;
-      const retryJobId = `comment-${accountId}-${commentId}-retry-${requeueAttempt + 1}`;
+    it("verifies deterministic delivery job ID format without colons", () => {
+      const scheduledAt = new Date("2026-11-09T12:00:00.000Z");
+      const id = deliverJobId({ id: "job_789", scheduledAt, deadlineAt: null });
 
-      expect(retryJobId).toBe("comment-acc_456-comm_789-retry-2");
-      expect(retryJobId).not.toContain(":");
+      expect(id).toBe(`deliver-job_789-${scheduledAt.getTime()}`);
+      expect(id).not.toContain(":");
     });
   });
 
@@ -202,269 +206,140 @@ describe("Local Services Integration — PostgreSQL & Redis/BullMQ", () => {
       automationId = auto.id;
     });
 
-    it("prevents double delivery: concurrent workers claiming the same trigger", async () => {
-      const triggerId = `comm_${Date.now()}`;
-      const candidateAuto = await prisma.automation.findUniqueOrThrow({
+    async function loadAutomation() {
+      return prisma.automation.findUniqueOrThrow({
         where: { id: automationId },
         include: { variations: true },
       });
+    }
 
-      // Two concurrent claims for the exact same comment
-      const [claim1, claim2] = await Promise.all([
-        claimDeliveryJob({
-          workspaceId,
-          instagramAccountId: accountId,
-          automation: candidateAuto as any,
-          commentId: triggerId,
-          commenterId: "commenter_1",
-          commenterName: "alice",
-          commentText: "INFO please",
-          matchedKeyword: "INFO",
-          trackedUrl: "https://example.com/r/slug1",
-        }),
-        claimDeliveryJob({
-          workspaceId,
-          instagramAccountId: accountId,
-          automation: candidateAuto as any,
-          commentId: triggerId,
-          commenterId: "commenter_1",
-          commenterName: "alice",
-          commentText: "INFO please",
-          matchedKeyword: "INFO",
-          trackedUrl: "https://example.com/r/slug1",
-        }),
-      ]);
-
-      // Exactly ONE claim must succeed, the other must fail (CLAIM_RACE or ALREADY_COMPLETED)
-      const successCount = [claim1, claim2].filter((c) => c.success).length;
-      expect(successCount).toBe(1);
-
-      const winningClaim = claim1.success ? claim1 : claim2;
-      const losingClaim = claim1.success ? claim2 : claim1;
-
-      expect(winningClaim.success).toBe(true);
-      expect(losingClaim.success).toBe(false);
-
-      // Verify the persisted job has the rendered message payload preserved
-      const persistedJob = await prisma.deliveryJob.findUnique({
-        where: { id: (winningClaim as any).deliveryJob.id },
+    async function createJob(commentId: string, commenterId: string, commenterName?: string) {
+      return createDeliveryJobForComment({
+        workspaceId,
+        instagramAccountId: accountId,
+        automation: {
+          ...(await loadAutomation()),
+          trackedLinks: [{ slug: "slug1", destinationUrl: "https://example.com", active: true }],
+        },
+        contactId: null,
+        commentId,
+        commenterId,
+        commenterName,
+        commentText: "INFO please",
+        mediaId: "media_1",
+        matchedKeyword: "INFO",
+        commentedAt: new Date(),
       });
-      expect(persistedJob?.messagePayload).toContain("https://example.com/r/slug1");
-      expect(persistedJob?.messagePayload).toContain("@alice");
-      expect(persistedJob?.status).toBe("SENDING");
+    }
+
+    const attempt = (n = 1) => ({ attemptNumber: n, startedAt: new Date() });
+
+    it("prevents double delivery: concurrent workers on the same trigger", async () => {
+      const triggerId = `comm_${Date.now()}`;
+
+      const created = await Promise.all([
+        createJob(triggerId, "commenter_1", "alice"),
+        createJob(triggerId, "commenter_1", "alice"),
+      ]);
+      expect(created.map((c) => c.outcome).sort()).toEqual(["CREATED", "EXISTING"]);
+      expect(created[0].job.id).toBe(created[1].job.id);
+
+      const claims = await Promise.all([
+        claimForSending(created[0].job.id),
+        claimForSending(created[0].job.id),
+      ]);
+      expect(claims.filter(Boolean)).toHaveLength(1);
+
+      const persistedJob = await prisma.deliveryJob.findUniqueOrThrow({
+        where: { id: created[0].job.id },
+      });
+      expect(persistedJob.messagePayload).toContain(`/r/slug1?d=${persistedJob.id}&s=`);
+      expect(persistedJob.messagePayload).toContain("@alice");
+      expect(persistedJob.status).toBe("SENDING");
+    });
+
+    it("enforces one active delivery per recipient and campaign in PostgreSQL", async () => {
+      const first = await createJob(`comm_a_${Date.now()}`, "commenter_dup");
+      const second = await createJob(`comm_b_${Date.now()}`, "commenter_dup");
+
+      expect(first.outcome).toBe("CREATED");
+      expect(second.outcome).toBe("DEDUPLICATED");
+      expect(second.job.status).toBe("SKIPPED_DEDUP");
+      expect(second.job.dedupOfDeliveryJobId).toBe(first.job.id);
     });
 
     it("transitions DeliveryJob state to SENT on success with attempt record", async () => {
-      const triggerId = `comm_sent_${Date.now()}`;
-      const candidateAuto = await prisma.automation.findUniqueOrThrow({
-        where: { id: automationId },
-        include: { variations: true },
-      });
+      const { job } = await createJob(`comm_sent_${Date.now()}`, "commenter_2");
+      await claimForSending(job.id);
+      await markSent(job.id, "meta_msg_999", attempt());
 
-      const claim = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: triggerId,
-        commenterId: "commenter_2",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      expect(claim.success).toBe(true);
-      const jobId = (claim as any).deliveryJob.id;
-
-      await transitionToSent(jobId, "meta_msg_999", 1, new Date());
-
-      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: jobId } });
+      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: job.id } });
       expect(updated.status).toBe("SENT");
       expect(updated.metaMessageId).toBe("meta_msg_999");
       expect(updated.sentAt).not.toBeNull();
 
-      const attempts = await prisma.deliveryAttempt.findMany({ where: { deliveryJobId: jobId } });
+      const attempts = await prisma.deliveryAttempt.findMany({ where: { deliveryJobId: job.id } });
       expect(attempts).toHaveLength(1);
       expect(attempts[0].status).toBe("SENT");
     });
 
     it("transitions DeliveryJob state to UNKNOWN on ambiguous outcome without retrying", async () => {
-      const triggerId = `comm_unk_${Date.now()}`;
-      const candidateAuto = await prisma.automation.findUniqueOrThrow({
-        where: { id: automationId },
-        include: { variations: true },
-      });
+      const { job } = await createJob(`comm_unk_${Date.now()}`, "commenter_3");
+      await claimForSending(job.id);
+      await markUnknown(job.id, { ...attempt(), errorMessage: "Connection reset by peer (ECONNRESET)" });
 
-      const claim = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: triggerId,
-        commenterId: "commenter_3",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      const jobId = (claim as any).deliveryJob.id;
-
-      await transitionToUnknown(jobId, 1, "Connection reset by peer (ECONNRESET)", undefined, new Date());
-
-      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: jobId } });
+      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: job.id } });
       expect(updated.status).toBe("UNKNOWN");
       expect(updated.lastError).toContain("ECONNRESET");
 
-      // Verify claiming an UNKNOWN job returns IN_FLIGHT_UNKNOWN and never re-sends
-      const retryClaim = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: triggerId,
-        commenterId: "commenter_3",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      expect(retryClaim.success).toBe(false);
-      expect((retryClaim as any).reason).toBe("IN_FLIGHT_UNKNOWN");
+      // An UNKNOWN job can never be claimed for sending again.
+      expect(await claimForSending(job.id)).toBeNull();
     });
 
-    it("transitions DeliveryJob state to FAILED on permanent failure", async () => {
-      const triggerId = `comm_fail_${Date.now()}`;
-      const candidateAuto = await prisma.automation.findUniqueOrThrow({
-        where: { id: automationId },
-        include: { variations: true },
-      });
+    it("transitions DeliveryJob state to FAILED on permanent failure and releases dedup", async () => {
+      const { job } = await createJob(`comm_fail_${Date.now()}`, "commenter_4");
+      await claimForSending(job.id);
+      await markFailedAfterSend(job.id, { ...attempt(), errorMessage: "Meta API error 100: Invalid parameter", errorCode: "100" });
 
-      const claim = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: triggerId,
-        commenterId: "commenter_4",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      const jobId = (claim as any).deliveryJob.id;
-
-      await transitionToPermanentFailure(jobId, 1, "Meta API error 100: Invalid parameter", "100", new Date());
-
-      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: jobId } });
+      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: job.id } });
       expect(updated.status).toBe("FAILED");
       expect(updated.lastError).toContain("Meta API error 100");
+      expect(updated.dedupKey).toBeNull();
     });
 
-    it("transitions DeliveryJob state to PENDING on retryable failure", async () => {
-      const triggerId = `comm_retry_${Date.now()}`;
-      const candidateAuto = await prisma.automation.findUniqueOrThrow({
-        where: { id: automationId },
-        include: { variations: true },
-      });
+    it("reschedules to PENDING after a definite, retryable rejection", async () => {
+      const { job } = await createJob(`comm_retry_${Date.now()}`, "commenter_5");
+      await claimForSending(job.id);
+      const retryAt = new Date(Date.now() + 120_000);
+      await rescheduleAfterAttempt(job.id, retryAt, { ...attempt(), rateLimited: true, errorMessage: "Rate limited", errorCode: "4" });
 
-      const claim = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: triggerId,
-        commenterId: "commenter_5",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      const jobId = (claim as any).deliveryJob.id;
-
-      await transitionToRetryable(jobId, 1, "Hourly rate limit hit", "RATE_LIMIT_REQUEUE", new Date());
-
-      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: jobId } });
+      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: job.id } });
       expect(updated.status).toBe("PENDING");
+      expect(updated.scheduledAt.getTime()).toBe(retryAt.getTime());
+      expect(updated.rateLimitDeferrals).toBe(1);
     });
 
-    it("transitions DeliveryJob state to FAILED on missing token and decryption failure", async () => {
-      const candidateAuto = await prisma.automation.findUniqueOrThrow({
-        where: { id: automationId },
-        include: { variations: true },
-      });
-
-      // 1. Test NO_TOKEN
-      const claim1 = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: `comm_notoken_${Date.now()}`,
-        commenterId: "commenter_tok1",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      const jobId1 = (claim1 as any).deliveryJob.id;
-      await transitionToPermanentFailure(jobId1, 1, "No Instagram access token available", "NO_TOKEN", new Date());
-
-      const updated1 = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: jobId1 } });
-      expect(updated1.status).toBe("FAILED");
-      expect(updated1.lastError).toBe("No Instagram access token available");
-      const attempt1 = await prisma.deliveryAttempt.findFirstOrThrow({ where: { deliveryJobId: jobId1 } });
-      expect(attempt1.errorCode).toBe("NO_TOKEN");
-
-      // 2. Test DECRYPT_FAILED
-      const claim2 = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: `comm_decrypt_${Date.now()}`,
-        commenterId: "commenter_tok2",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      const jobId2 = (claim2 as any).deliveryJob.id;
-      await transitionToPermanentFailure(jobId2, 1, "Failed to decrypt Instagram access token", "DECRYPT_FAILED", new Date());
-
-      const updated2 = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: jobId2 } });
-      expect(updated2.status).toBe("FAILED");
-      const attempt2 = await prisma.deliveryAttempt.findFirstOrThrow({ where: { deliveryJobId: jobId2 } });
-      expect(attempt2.errorCode).toBe("DECRYPT_FAILED");
+    it("closes PENDING jobs on missing token, decryption failure and plan limit", async () => {
+      for (const [code, status] of [
+        ["NO_TOKEN", "FAILED"],
+        ["DECRYPT_FAILED", "FAILED"],
+        ["PLAN_LIMIT", "SKIPPED_PLAN_LIMIT"],
+      ] as const) {
+        const { job } = await createJob(`comm_${code}_${Date.now()}`, `commenter_${code}`);
+        expect(await closePending(job.id, status, `closed: ${code}`, code)).toBe(true);
+        const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: job.id } });
+        expect(updated).toMatchObject({ status, errorCode: code, dedupKey: null });
+      }
     });
 
-    it("transitions DeliveryJob state on quota/rate-limit thresholds", async () => {
-      const candidateAuto = await prisma.automation.findUniqueOrThrow({
-        where: { id: automationId },
-        include: { variations: true },
-      });
+    it("defers rate-limited jobs instead of dropping them", async () => {
+      const { job } = await createJob(`comm_defer_${Date.now()}`, "commenter_defer");
+      const later = new Date(Date.now() + 3_600_000);
+      expect(await deferPending(job.id, later, "throughput limit")).toBe(true);
 
-      // 1. Test PLAN_LIMIT failure
-      const claim1 = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: `comm_planlim_${Date.now()}`,
-        commenterId: "commenter_lim1",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      const jobId1 = (claim1 as any).deliveryJob.id;
-      await transitionToPermanentFailure(jobId1, 1, "Monthly DM limit reached (500)", "PLAN_LIMIT", new Date());
-
-      const updated1 = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: jobId1 } });
-      expect(updated1.status).toBe("FAILED");
-      expect(updated1.lastError).toContain("Monthly DM limit reached");
-      const attempt1 = await prisma.deliveryAttempt.findFirstOrThrow({ where: { deliveryJobId: jobId1 } });
-      expect(attempt1.errorCode).toBe("PLAN_LIMIT");
-
-      // 2. Test RATE_LIMIT_EXHAUSTED failure
-      const claim2 = await claimDeliveryJob({
-        workspaceId,
-        instagramAccountId: accountId,
-        automation: candidateAuto as any,
-        commentId: `comm_rateexh_${Date.now()}`,
-        commenterId: "commenter_lim2",
-        commentText: "DEMO",
-        matchedKeyword: "DEMO",
-      });
-      const jobId2 = (claim2 as any).deliveryJob.id;
-      await transitionToPermanentFailure(
-        jobId2,
-        3,
-        "Hourly Instagram DM rate limit reached; max retries exhausted",
-        "RATE_LIMIT_EXHAUSTED",
-        new Date()
-      );
-
-      const updated2 = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: jobId2 } });
-      expect(updated2.status).toBe("FAILED");
-      expect(updated2.lastError).toContain("max retries exhausted");
-      const attempt2 = await prisma.deliveryAttempt.findFirstOrThrow({ where: { deliveryJobId: jobId2 } });
-      expect(attempt2.errorCode).toBe("RATE_LIMIT_EXHAUSTED");
+      const updated = await prisma.deliveryJob.findUniqueOrThrow({ where: { id: job.id } });
+      expect(updated.status).toBe("PENDING");
+      expect(updated.rateLimitDeferrals).toBe(1);
     });
   });
 
@@ -498,8 +373,10 @@ describe("Local Services Integration — PostgreSQL & Redis/BullMQ", () => {
         },
       });
 
+      const publishedAfterCampaign = new Date(nextPostAuto.createdAt.getTime() + 60_000);
+
       // Claim for first post media_100
-      const claimed1 = await claimNextPostAutomation(nextPostAuto.id, "media_100");
+      const claimed1 = await claimNextPostAutomation(nextPostAuto.id, "media_100", publishedAfterCampaign);
       expect(claimed1).toBe(true);
 
       // Verify post was consumed in DB
@@ -508,12 +385,12 @@ describe("Local Services Integration — PostgreSQL & Redis/BullMQ", () => {
       expect(updated.consumedAt).not.toBeNull();
 
       // Second claim for DIFFERENT media_200 must fail
-      const claimed2 = await claimNextPostAutomation(nextPostAuto.id, "media_200");
+      const claimed2 = await claimNextPostAutomation(nextPostAuto.id, "media_200", publishedAfterCampaign);
       expect(claimed2).toBe(false);
 
-      // Once consumed, subsequent atomic claims return false (consumedPostId is no longer null)
-      const claimedAgain = await claimNextPostAutomation(nextPostAuto.id, "media_100");
-      expect(claimedAgain).toBe(false);
+      // The consuming post keeps matching (replays and other commenters on it).
+      const claimedAgain = await claimNextPostAutomation(nextPostAuto.id, "media_100", publishedAfterCampaign);
+      expect(claimedAgain).toBe(true);
     });
 
     it("evaluates SPECIFIC_POST, NEXT_POST, and ANY_POST according to strict priority", () => {

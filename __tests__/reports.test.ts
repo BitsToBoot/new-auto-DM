@@ -6,7 +6,7 @@ const { mockPrisma } = vi.hoisted(() => ({
     automation: {
       findFirst: vi.fn(),
     },
-    dmLog: {
+    deliveryJob: {
       groupBy: vi.fn(),
       findFirst: vi.fn(),
       count: vi.fn(),
@@ -57,7 +57,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockPrisma.$queryRaw.mockResolvedValue([]);
   mockPrisma.automation.findFirst.mockResolvedValue(baseAutomation);
-  mockPrisma.dmLog.groupBy
+  mockPrisma.deliveryJob.groupBy
     .mockResolvedValueOnce([
       { status: "SENT", _count: { _all: 20 } },
       { status: "FAILED", _count: { _all: 1 } },
@@ -68,11 +68,11 @@ beforeEach(() => {
       { matchedKeyword: "SHOP", _count: { _all: 6 } },
     ]);
   mockPrisma.linkClick.count.mockResolvedValue(12);
-  mockPrisma.dmLog.findFirst.mockResolvedValue({
-    dmSentAt: new Date("2026-05-20T12:00:00.000Z"),
+  mockPrisma.deliveryJob.findFirst.mockResolvedValue({
+    sentAt: new Date("2026-05-20T12:00:00.000Z"),
     createdAt: new Date("2026-05-20T12:00:00.000Z"),
   });
-  mockPrisma.dmLog.count.mockResolvedValue(2);
+  mockPrisma.deliveryJob.count.mockResolvedValue(2);
 });
 
 describe("campaign reports", () => {

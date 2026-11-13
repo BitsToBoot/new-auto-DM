@@ -1,6 +1,8 @@
 # CampaignCue
 
-Open-source Instagram comment-to-DM campaign OS for businesses, creators, and agencies.
+A SaaS platform for Instagram comment-to-DM automation.
+
+Maintained by Shubham Sharma and Yashwant Khatri. CampaignCue is a fork of [instagram-comment-to-dm](https://github.com/im-anishraj/instagram-comment-to-dm) by Anish Raj. See [Attribution](#attribution).
 
 CampaignCue turns comments like `LINK`, `PRICE`, or `GUIDE` into Meta-compliant private replies. The core engine is MIT licensed and self-hostable. The hosted SaaS layer is being built for agencies that want campaign templates, analytics, client reports, and managed reliability.
 
@@ -54,7 +56,7 @@ Then open:
 http://localhost:3000
 ```
 
-Screenshots and GIFs are planned in issue [#17](https://github.com/im-anishraj/instagram-comment-to-dm/issues/17). Good launch assets to add:
+Screenshots and GIFs are still to come (originally planned in upstream issue [#17](https://github.com/im-anishraj/instagram-comment-to-dm/issues/17)). Good launch assets to add:
 
 - Landing page hero screenshot.
 - Dashboard overview screenshot.
@@ -92,8 +94,8 @@ The core remains public so builders can self-host, audit, fork, and contribute.
 ### Install
 
 ```bash
-git clone https://github.com/im-anishraj/instagram-comment-to-dm.git
-cd instagram-comment-to-dm
+git clone https://github.com/BitsToBoot/new-auto-DM.git
+cd new-auto-DM
 npm install
 ```
 
@@ -153,7 +155,7 @@ For production deployment, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Roadmap
 
-The public launch roadmap is tracked in GitHub issues:
+The launch roadmap below was completed in the upstream project's GitHub issues, before this fork:
 
 - [#7 Production readiness](https://github.com/im-anishraj/instagram-comment-to-dm/issues/7) - done
 - [#8 Campaign OS repositioning](https://github.com/im-anishraj/instagram-comment-to-dm/issues/8) - done
@@ -168,11 +170,7 @@ See [ROADMAP.md](ROADMAP.md) for the grouped plan.
 
 ## Good First Issues
 
-Want to help? Start with the public issue list:
-
-- [Good first issues](https://github.com/im-anishraj/instagram-comment-to-dm/issues?q=is%3Aissue+is%3Aopen+label%3Atype%3Agood-first-issue)
-- [Documentation issues](https://github.com/im-anishraj/instagram-comment-to-dm/issues?q=is%3Aissue+is%3Aopen+label%3Atype%3Adocs)
-- [Template issues](https://github.com/im-anishraj/instagram-comment-to-dm/issues?q=is%3Aissue+is%3Aopen+label%3Aarea%3Atemplates)
+Want to help? Start with the [CampaignCue issue list](https://github.com/BitsToBoot/new-auto-DM/issues).
 
 If you build a campaign template that works for your niche, open an issue or pull request.
 
@@ -193,8 +191,20 @@ npm run build
 - Use GitHub Discussions for launch ideas, self-hosting questions, and campaign templates.
 - Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
 
+## Maintainers
+
+- Shubham Sharma
+- Yashwant Khatri
+
+## Attribution
+
+CampaignCue is built on [instagram-comment-to-dm](https://github.com/im-anishraj/instagram-comment-to-dm), created by Anish Raj and released under the MIT License. The original codebase, including the CampaignCue name and product positioning, came from that project. This fork adds its own features and hardening on top. [NOTICE](NOTICE) explains which parts come from upstream and which were added here.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+- Upstream code: Copyright (c) 2026 Anish Raj.
+- Fork modifications and additions: Copyright (c) 2026 Shubham Sharma and Yashwant Khatri.
 
 The open-source core is MIT licensed. The hosted SaaS, managed infrastructure, support, and future agency features are monetized separately. See [docs/open-core.md](docs/open-core.md).

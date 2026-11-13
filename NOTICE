@@ -1,0 +1,35 @@
+CampaignCue
+A SaaS platform for Instagram comment-to-DM automation.
+
+Maintained by Shubham Sharma and Yashwant Khatri.
+
+This repository is a fork of instagram-comment-to-dm by Anish Raj:
+https://github.com/im-anishraj/instagram-comment-to-dm
+
+The whole repository is distributed under the MIT License (see LICENSE).
+
+Upstream contributions
+----------------------
+Copyright (c) 2026 Anish Raj
+
+The initial import of this repository (commit df7e7a7) is the upstream
+instagram-comment-to-dm codebase, including the CampaignCue name, landing
+pages, documentation, Prisma schema and migrations, and the original web app
+and worker. Those portions remain the work of Anish Raj and are used under the
+MIT License. Upstream files that were later modified are still upstream work,
+with the fork's changes layered on top.
+
+CampaignCue fork contributions
+------------------------------
+Copyright (c) 2026 Shubham Sharma and Yashwant Khatri
+
+Changes made after the initial import, as recorded in this repository's git
+history. They include automation matching, policy and resolver logic; the
+delivery state, claim and renderer modules; CRM contacts; CSV exports; data
+retention; tracked-link APIs; the contacts dashboard; and the related tests,
+migrations and hardening work. Run `git log` for the authoritative record.
+
+Third-party software
+--------------------
+Dependencies are installed from npm and remain under their own licenses, as
+declared in each package. No third-party source is vendored in this repository.

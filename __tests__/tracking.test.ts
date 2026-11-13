@@ -7,9 +7,9 @@ import {
 import {
   buildTrackedUrl,
   extractFirstUrl,
-  renderMessageWithTracking,
   replaceUrlWithTrackedPlaceholder,
 } from "../lib/tracking/message";
+import { renderDmMessage } from "../lib/delivery/renderer";
 
 describe("tracked link messages", () => {
   it("extracts a destination URL and replaces it with the tracked placeholder", () => {
@@ -23,33 +23,23 @@ describe("tracked link messages", () => {
     );
   });
 
+  // Rendering now goes through the single canonical renderer. {username}
+  // renders as "@handle" everywhere (the old tracking renderer omitted "@").
   it("renders tracked URLs with username personalization", () => {
     expect(
-      renderMessageWithTracking({
-        message: "Hey {username}, grab it here: {link}",
-        commenterName: "Maya",
-        trackedLinks: [
-          {
-            slug: "abc123",
-            destinationUrl: "https://example.com/guide",
-          },
-        ],
-        baseUrl: "https://campaigncue.com",
+      renderDmMessage("Hey {username}, grab it here: {link}", {
+        username: "Maya",
+        trackedUrl: buildTrackedUrl("abc123", "https://campaigncue.com"),
+        destinationUrl: "https://example.com/guide",
       })
-    ).toBe("Hey Maya, grab it here: https://campaigncue.com/r/abc123");
+    ).toBe("Hey @Maya, grab it here: https://campaigncue.com/r/abc123");
   });
 
   it("can replace a raw destination URL when the placeholder is missing", () => {
     expect(
-      renderMessageWithTracking({
-        message: "Link: https://example.com/guide",
-        trackedLinks: [
-          {
-            slug: "abc123",
-            destinationUrl: "https://example.com/guide",
-          },
-        ],
-        baseUrl: "https://campaigncue.com/",
+      renderDmMessage("Link: https://example.com/guide", {
+        trackedUrl: buildTrackedUrl("abc123", "https://campaigncue.com/"),
+        destinationUrl: "https://example.com/guide",
       })
     ).toBe("Link: https://campaigncue.com/r/abc123");
   });
@@ -59,15 +49,9 @@ describe("tracked link messages", () => {
       replaceUrlWithTrackedPlaceholder("Link: https://example.com", "https://example.com/")
     ).toBe("Link: {link}");
     expect(
-      renderMessageWithTracking({
-        message: "Link: https://example.com",
-        trackedLinks: [
-          {
-            slug: "abc123",
-            destinationUrl: "https://example.com/",
-          },
-        ],
-        baseUrl: "https://campaigncue.com",
+      renderDmMessage("Link: https://example.com", {
+        trackedUrl: buildTrackedUrl("abc123", "https://campaigncue.com"),
+        destinationUrl: "https://example.com/",
       })
     ).toBe("Link: https://campaigncue.com/r/abc123");
   });
@@ -76,6 +60,15 @@ describe("tracked link messages", () => {
     expect(buildTrackedUrl("abc123", "https://campaigncue.com/")).toBe(
       "https://campaigncue.com/r/abc123"
     );
+  });
+
+  it("appends delivery attribution through the same canonical builder", () => {
+    expect(
+      buildTrackedUrl("abc123", "https://campaigncue.com", {
+        deliveryJobId: "job_1",
+        signature: "sig",
+      })
+    ).toBe("https://campaigncue.com/r/abc123?d=job_1&s=sig");
   });
 });
 

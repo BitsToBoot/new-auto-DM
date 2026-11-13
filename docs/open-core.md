@@ -49,6 +49,6 @@ The SaaS monetization layer should compete on reliability, speed, workflow, and 
 
 ## Boundary
 
-The repo remains MIT unless the maintainer changes licensing in a future version.
+The repo is MIT licensed. Upstream code from instagram-comment-to-dm stays under the MIT License granted by its original author, Anish Raj. Any future licensing change by the CampaignCue maintainers could only apply to code they own. See [NOTICE](../NOTICE).
 
 Paid hosted features should be communicated clearly and should not mislead self-hosters about what is available in the public core.

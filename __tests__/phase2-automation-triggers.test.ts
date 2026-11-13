@@ -197,7 +197,8 @@ describe("Phase 2 — NEXT_POST Atomic Claim Concurrency", () => {
   it("claims the unconsumed post atomically with count 1", async () => {
     mockPrisma.automation.updateMany.mockResolvedValue({ count: 1 });
 
-    const claimed = await claimNextPostAutomation("auto_next_1", "media_999");
+    const publishedAt = new Date("2026-05-02T10:00:00.000Z");
+    const claimed = await claimNextPostAutomation("auto_next_1", "media_999", publishedAt);
     expect(claimed).toBe(true);
     expect(mockPrisma.automation.updateMany).toHaveBeenCalledWith({
       where: {
@@ -205,6 +206,8 @@ describe("Phase 2 — NEXT_POST Atomic Claim Concurrency", () => {
         triggerScope: "NEXT_POST",
         isActive: true,
         consumedPostId: null,
+        // Never let a post published before the campaign consume it.
+        createdAt: { lte: new Date(publishedAt.getTime() + 999) },
       },
       data: {
         consumedPostId: "media_999",
@@ -215,9 +218,17 @@ describe("Phase 2 — NEXT_POST Atomic Claim Concurrency", () => {
 
   it("rejects claim when concurrent worker already claimed the post (count 0)", async () => {
     mockPrisma.automation.updateMany.mockResolvedValue({ count: 0 });
+    mockPrisma.automation.findUnique.mockResolvedValue({ consumedPostId: "media_other" });
 
-    const claimed = await claimNextPostAutomation("auto_next_1", "media_999");
+    const claimed = await claimNextPostAutomation("auto_next_1", "media_999", new Date());
     expect(claimed).toBe(false);
+  });
+
+  it("treats a concurrent claim by the SAME media as a win", async () => {
+    mockPrisma.automation.updateMany.mockResolvedValue({ count: 0 });
+    mockPrisma.automation.findUnique.mockResolvedValue({ consumedPostId: "media_999" });
+
+    expect(await claimNextPostAutomation("auto_next_1", "media_999", new Date())).toBe(true);
   });
 
   it("resolves automation for comment across SPECIFIC, NEXT, and ANY triggers", async () => {
@@ -235,14 +246,19 @@ describe("Phase 2 — NEXT_POST Atomic Claim Concurrency", () => {
         createdAt: new Date("2026-05-01"),
         keywordsList: [{ keyword: "DISCOUNT", normalizedKeyword: "discount" }],
         variations: [],
+        trackedLinks: [],
       },
     ]);
 
+    const getMediaPublishedAt = vi.fn();
     const result = await resolveAutomationForComment({
       instagramAccountId: "acc_1",
       mediaId: "post_888",
       commentText: "Give me the discount!",
+      getMediaPublishedAt,
     });
+    // No NEXT_POST candidate: the media publish time is never fetched.
+    expect(getMediaPublishedAt).not.toHaveBeenCalled();
 
     expect(result).not.toBeNull();
     expect(result?.automation.id).toBe("auto_any_1");

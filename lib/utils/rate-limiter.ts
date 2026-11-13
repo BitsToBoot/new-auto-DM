@@ -7,6 +7,11 @@
  *
  * Key pattern: `rate:dm:{instagramAccountId}`  (1-hour TTL)
  *
+ * A blocked reservation is NEVER a reason to drop a delivery: callers defer
+ * the DeliveryJob durably until the window resets (see `requeueDelayMs`, which
+ * is the real remaining window TTL) and keep retrying until the job's
+ * private-reply deadline.
+ *
  * NOTE: This limits OUR sending throughput. It does not represent Meta's
  * actual platform policies; Meta errors are handled separately in
  * lib/meta/client.ts.
@@ -19,6 +24,7 @@ import { DELIVERY_CONFIG } from "@/lib/config/delivery";
 export const RATE_LIMIT_MAX = DELIVERY_CONFIG.dmPerHourPerAccount;
 export const RATE_LIMIT_WINDOW = DELIVERY_CONFIG.dmRateWindowSeconds;
 export const REQUEUE_DELAY_MS = DELIVERY_CONFIG.requeueDelayMs;
+/** @deprecated Rate-limited deliveries are no longer skipped after N requeues. */
 export const MAX_REQUEUE_ATTEMPTS = DELIVERY_CONFIG.maxRequeueAttempts;
 
 export interface RateLimitResult {
@@ -26,7 +32,9 @@ export interface RateLimitResult {
   currentCount: number;
   remainingDMs: number;
   shouldRequeue: boolean;
+  /** When blocked: ms until the current window resets. */
   requeueDelayMs: number;
+  /** Always false: rate limiting never drops a delivery. */
   shouldSkip: boolean;
   reserved: boolean;
 }
@@ -43,7 +51,7 @@ local max     = tonumber(ARGV[1])
 local ttl     = tonumber(ARGV[2])
 
 if current >= max then
-  return {0, current, 0}
+  return {0, current, 0, redis.call("PTTL", KEYS[1])}
 end
 
 local next_count = redis.call("INCR", KEYS[1])
@@ -68,24 +76,16 @@ function toNumber(value: unknown): number {
   return 0;
 }
 
-function blockedResult(count: number, requeueAttempt: number): RateLimitResult {
-  if (requeueAttempt >= DELIVERY_CONFIG.maxRequeueAttempts) {
-    return {
-      allowed: false,
-      currentCount: count,
-      remainingDMs: 0,
-      shouldRequeue: false,
-      requeueDelayMs: 0,
-      shouldSkip: true,
-      reserved: false,
-    };
-  }
+function blockedResult(count: number, windowTtlMs?: number): RateLimitResult {
   return {
     allowed: false,
     currentCount: count,
     remainingDMs: 0,
     shouldRequeue: true,
-    requeueDelayMs: DELIVERY_CONFIG.requeueDelayMs,
+    requeueDelayMs:
+      windowTtlMs !== undefined && windowTtlMs > 0
+        ? windowTtlMs
+        : DELIVERY_CONFIG.requeueDelayMs,
     shouldSkip: false,
     reserved: false,
   };
@@ -97,7 +97,9 @@ function blockedResult(count: number, requeueAttempt: number): RateLimitResult {
  */
 export async function checkRateLimit(
   instagramAccountId: string,
-  requeueAttempt = 0,
+  // Kept for positional compatibility (redis is the 3rd argument); ignored.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _requeueAttempt = 0,
   redis?: Redis
 ): Promise<RateLimitResult> {
   const client = redis ?? (await getDefaultRedis());
@@ -106,7 +108,7 @@ export async function checkRateLimit(
   const count = raw ? Number.parseInt(raw, 10) : 0;
 
   if (count >= DELIVERY_CONFIG.dmPerHourPerAccount) {
-    return blockedResult(count, requeueAttempt);
+    return blockedResult(count, toNumber(await client.pttl(key)));
   }
 
   return {
@@ -127,7 +129,9 @@ export async function checkRateLimit(
  */
 export async function reserveDMSlot(
   instagramAccountId: string,
-  requeueAttempt = 0,
+  // Kept for positional compatibility (redis is the 3rd argument); ignored.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _requeueAttempt = 0,
   redis?: Redis
 ): Promise<RateLimitResult> {
   const client = redis ?? (await getDefaultRedis());
@@ -147,7 +151,7 @@ export async function reserveDMSlot(
   const remaining = toNumber(values[2]);
 
   if (allowedFlag !== 1) {
-    return blockedResult(count, requeueAttempt);
+    return blockedResult(count, values[3] !== undefined ? toNumber(values[3]) : undefined);
   }
 
   return {

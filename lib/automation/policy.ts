@@ -49,6 +49,26 @@ export function getScopePriority(triggerScope: string): number {
   }
 }
 
+function compareMatches(a: MatchedAutomationResult, b: MatchedAutomationResult): number {
+  const pA = getScopePriority(a.automation.triggerScope);
+  const pB = getScopePriority(b.automation.triggerScope);
+  if (pA !== pB) return pA - pB;
+
+  const timeDiff =
+    new Date(a.automation.createdAt).getTime() -
+    new Date(b.automation.createdAt).getTime();
+  if (timeDiff !== 0) return timeDiff;
+
+  return a.automation.id < b.automation.id ? -1 : a.automation.id > b.automation.id ? 1 : 0;
+}
+
+/** Returns matches in deterministic priority order (best first). */
+export function sortMatchesByPriority(
+  matches: MatchedAutomationResult[]
+): MatchedAutomationResult[] {
+  return [...matches].sort(compareMatches);
+}
+
 /**
  * Sorts matching automations deterministically to select the single winning automation.
  */
@@ -56,21 +76,5 @@ export function selectWinningAutomation(
   matches: MatchedAutomationResult[]
 ): MatchedAutomationResult | null {
   if (!matches || matches.length === 0) return null;
-  if (matches.length === 1) return matches[0];
-
-  const sorted = [...matches].sort((a, b) => {
-    const pA = getScopePriority(a.automation.triggerScope);
-    const pB = getScopePriority(b.automation.triggerScope);
-
-    if (pA !== pB) return pA - pB;
-
-    const timeDiff =
-      new Date(a.automation.createdAt).getTime() -
-      new Date(b.automation.createdAt).getTime();
-    if (timeDiff !== 0) return timeDiff;
-
-    return a.automation.id.localeCompare(b.automation.id);
-  });
-
-  return sorted[0];
+  return sortMatchesByPriority(matches)[0];
 }

@@ -6,9 +6,11 @@ This roadmap is optimized for three goals:
 2. Make the public repo worth sharing.
 3. Differentiate from broad chatbot platforms by becoming an Instagram campaign operating system.
 
+Issue links below point to the upstream [instagram-comment-to-dm](https://github.com/im-anishraj/instagram-comment-to-dm) tracker, where this work was originally planned. New work for CampaignCue is tracked at [BitsToBoot/new-auto-DM](https://github.com/BitsToBoot/new-auto-DM/issues).
+
 ## Phase 0: Foundation
 
-Status: merged through issue [#14](https://github.com/im-anishraj/instagram-comment-to-dm/issues/14).
+Status: merged through upstream issue [#14](https://github.com/im-anishraj/instagram-comment-to-dm/issues/14).
 
 - Email magic-link auth.
 - Workspace tenancy.

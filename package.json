@@ -2,6 +2,27 @@
   "name": "campaigncue",
   "version": "0.1.0",
   "private": true,
+  "description": "A SaaS platform for Instagram comment-to-DM automation.",
+  "license": "MIT",
+  "contributors": [
+    {
+      "name": "Shubham Sharma"
+    },
+    {
+      "name": "Yashwant Khatri"
+    },
+    {
+      "name": "Anish Raj",
+      "url": "https://github.com/im-anishraj"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BitsToBoot/new-auto-DM.git"
+  },
+  "bugs": {
+    "url": "https://github.com/BitsToBoot/new-auto-DM/issues"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -9,6 +30,7 @@
     "lint": "eslint",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
+    "db:backfill-deliveries": "tsx scripts/backfill-delivery-jobs.ts",
     "worker": "tsx worker/dm-worker.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
